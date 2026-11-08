@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+import os
+import json
+import base64
+import mimetypes
+import secrets
+import time
+import traceback
+import hashlib
+import struct
+import zlib
+import random
+import urllib.request
+import urllib.parse
+import ssl
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+
+PORT = int(os.environ.get("PORT", 17930))
+AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", Path.home() / "files" / "audiobooks"))
+USERS_FILE = Path(__file__).parent / "users.json"
+PROGRESS_FILE = Path(__file__).parent / "progress.json"
+METADATA_FILE = Path(__file__).parent / "metadata.json"
+PREFS_FILE = Path(__file__).parent / "prefs.json"
+BOOKMARKS_FILE = Path(__file__).parent / "bookmarks.json"
+COLLECTIONS_FILE = Path(__file__).parent / "collections.json"
+FINISHED_FILE = Path(__file__).parent / "finished.json"
+LIBRARIES_FILE = Path(__file__).parent / "libraries.json"
+SEAL_FILE = Path(__file__).parent / "subsonic-auth.json"
+SEAL_KEY_FILE = Path(__file__).parent / "subsonic.key"
+PLAYQUEUE_FILE = Path(__file__).parent / "playqueue.json"
+COVER_CACHE = Path(__file__).parent / "covers"
+COVER_CACHE.mkdir(exist_ok=True)
+SESSIONS = {}
+BOOKS_CACHE = {"data": None, "mtime": 0}
+COVER_FETCH_LOCK = threading.Lock()
+COVER_FETCHING = set()
+
+# Register m4b MIME type (Python doesn't know it by default)
+mimetypes.add_type("audio/mp4", ".m4b")
+mimetypes.add_type("audio/mp4", ".m4a")
+
+AUDIO_EXTS = {".mp3", ".m4b", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac", ".webm"}
+COVER_NAMES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg",
+               "folder.png", "album.jpg", "front.jpg"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+def hash_password(password: str, salt: bytes = None) -> str:
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+    return base64.b64encode(salt + dk).decode()
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        raw = base64.b64decode(stored)
+        salt, dk = raw[:16], raw[16:]
+        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000) == dk
+    except Exception:
+        return False
+
+def seal_key():
+    if not SEAL_KEY_FILE.exists():
+        SEAL_KEY_FILE.write_bytes(secrets.token_bytes(32))
+    return SEAL_KEY_FILE.read_bytes()
+
+def seal_password(password: str) -> str:
+    raw = password.encode()
+    stream = b""
+    n = 0
+    while len(stream) < len(raw):
+        stream += hashlib.sha256(seal_key() + n.to_bytes(4, "big")).digest()
+        n += 1
+    return base64.b64encode(bytes(a ^ b for a, b in zip(raw, stream))).decode()
+
+def unseal_password(token: str) -> str:
+    raw = base64.b64decode(token)
+    stream = b""

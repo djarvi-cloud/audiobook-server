@@ -4,10 +4,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required"
   exit 1
 fi
-# Assemble server.py from parts if present
-if [ -d parts ] && [ -f parts/p00.txt ]; then
-  echo "Assembling server.py from parts..."
-  cat parts/p*.txt > server.py
+# Assemble server.py from base64-encoded gzipped parts if present
+if [ -d _gz ] && [ -f _gz/00 ]; then
+  echo "Assembling server.py from compressed parts..."
+  cat _gz/* | base64 -d | gunzip > server.py
   chmod +x server.py
 fi
 if [ ! -f https-url.txt ]; then

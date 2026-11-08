@@ -1,6 +1,6 @@
 # Audiobook server
 
-Single-file Python audiobook server for a Whatbox seedbox. No extra packages.
+Single-file Python audiobook (and music) server for a Whatbox seedbox. No extra packages. OpenSubsonic / Subsonic compatible.
 
 ## Install
 
@@ -16,7 +16,7 @@ Books default to `~/files/audiobooks`. Music defaults to `~/files/music`. If the
 AUDIO_DIR=~/files/audiobooks MUSIC_DIR=~/files/music PORT=17930 ./install.sh
 ```
 
-Music is scanned the way Subsonic clients expect: `Artist/Album/Song` when that layout is present, otherwise each folder with audio files is an album. It shows up as its own music folder in Subsonic (`getMusicFolders`). Audiobook progress, collections, and the book web UI stay book-only.
+Music is scanned the way Subsonic clients expect: `Artist/Album/Song` when that layout is present, otherwise each folder with audio files is an album. The website has separate Audiobooks and Music tabs. Subsonic clients see music as its own folder (`getMusicFolders`). Audiobook progress, collections, and finished-book lists stay book-only.
 
 Playlists are stored in `playlists.json` next to the other data files and are managed through the Subsonic API (`getPlaylists`, `getPlaylist`, `createPlaylist`, `updatePlaylist`, `deletePlaylist`). The owner is the authenticated user. Other users can see a playlist only when it is public; only the owner can change or delete it. A playlist may include music tracks and audiobook chapters.
 

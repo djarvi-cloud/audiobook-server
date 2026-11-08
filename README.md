@@ -18,7 +18,7 @@ AUDIO_DIR=~/files/audiobooks MUSIC_DIR=~/files/music PORT=17930 ./install.sh
 
 Music is scanned the way Subsonic clients expect: `Artist/Album/Song` when that layout is present, otherwise each folder with audio files is an album. The website has separate Audiobooks and Music tabs. Subsonic clients see music as its own folder (`getMusicFolders`). Audiobook progress, collections, and finished-book lists stay book-only.
 
-Playlists are stored in `playlists.json` next to the other data files and are managed through the Subsonic API (`getPlaylists`, `getPlaylist`, `createPlaylist`, `updatePlaylist`, `deletePlaylist`). The owner is the authenticated user. Other users can see a playlist only when it is public; only the owner can change or delete it. A playlist may include music tracks and audiobook chapters.
+Playlists are stored in `playlists.json` (not in git). Each logged-in user creates and manages their own from the website (Playlists) or a Subsonic client. A playlist is visible to other users only when it is public, and only the owner can change or delete it. A playlist may include music tracks and audiobook chapters.
 
 Log in at https://audobooks.covertsa.com once after the first start so Subsonic apps can connect. Default user is `admin` / `changeme` until you change it.
 

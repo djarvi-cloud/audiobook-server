@@ -2403,6 +2403,152 @@ def new_playlist(username, name, song_ids):
     save_playlists()
     return pl
 
+def resolved_song_positions(pl):
+    positions = []
+    for n, sid in enumerate(pl.get("songIds") or []):
+        if resolve_song(sid):
+            positions.append(n)
+    return positions
+
+def drop_resolved_indexes(pl, indexes):
+    positions = resolved_song_positions(pl)
+    drop = set()
+    for raw in indexes:
+        if not str(raw).lstrip("-").isdigit():
+            continue
+        i = int(raw)
+        if 0 <= i < len(positions):
+            drop.add(positions[i])
+    if drop:
+        pl["songIds"] = [sid for n, sid in enumerate(pl.get("songIds") or []) if n not in drop]
+
+def song_ids_for_item(item_id):
+    book = get_book_by_id(item_id)
+    if not book:
+        return []
+    if str(item_id).startswith("mal:") or book.get("kind") == "music":
+        album = music_album_by_id(item_id)
+        if not album:
+            return []
+        return [info["id"] for info in album.get("files") or [] if info.get("id")]
+    return [song_key(book, i) for i in range(len(book.get("files") or []))]
+
+def web_playlist_tracks(pl):
+    tracks = []
+    for sid in pl.get("songIds") or []:
+        song = resolve_song(sid)
+        if not song:
+            continue
+        album_id = song.get("albumId") or ""
+        if album_id.startswith("al:"):
+            book_id = album_id[3:]
+            file_index = max(0, int(song.get("track") or 1) - 1)
+        elif album_id.startswith("mal:"):
+            book_id = album_id
+            album = music_album_by_id(album_id)
+            files = (album or {}).get("files") or []
+            file_index = next((i for i, info in enumerate(files) if info.get("id") == song.get("id")), 0)
+        else:
+            continue
+        tracks.append({
+            "songId": song.get("id"),
+            "title": song.get("title") or "",
+            "artist": song.get("artist") or "",
+            "album": song.get("album") or "",
+            "bookId": book_id,
+            "fileIndex": file_index,
+        })
+    return tracks
+
+def web_playlist(pl, username, with_songs=False):
+    tracks = web_playlist_tracks(pl)
+    obj = {
+        "id": str(pl.get("id")),
+        "name": pl.get("name") or "Playlist",
+        "owner": pl.get("owner") or "",
+        "public": bool(pl.get("public")),
+        "mine": pl.get("owner") == username,
+        "songCount": len(tracks),
+        "changed": pl.get("changed") or "",
+    }
+    if with_songs:
+        obj["songs"] = tracks
+    return obj
+
+def visible_playlists(username):
+    rows = [web_playlist(pl, username) for pl in playlists.values() if playlist_visible(pl, username)]
+    rows.sort(key=lambda item: (0 if item["mine"] else 1, (item.get("name") or "").lower()))
+    return rows
+
+def playlist_page_id(pid):
+    return isinstance(pid, str) and pid.isdigit() and 0 < len(pid) < 12
+
+def mutate_playlist(username, data):
+    action = (data or {}).get("action")
+    if action == "create":
+        name = (data.get("name") or "").strip()
+        if not name:
+            return 400, "Name required"
+        pl = new_playlist(username, name, [])
+        return 200, web_playlist(pl, username, with_songs=True)
+    pid = str(data.get("id") or "")
+    pl = playlist_get(pid) if playlist_page_id(pid) else None
+    if not pl or not playlist_visible(pl, username):
+        return 404, "Playlist not found"
+    if not playlist_owned(pl, username):
+        return 403, "Not your playlist"
+    if action == "rename":
+        name = (data.get("name") or "").strip()
+        if not name:
+            return 400, "Name required"
+        pl["name"] = name
+    elif action == "public":
+        pl["public"] = bool(data.get("public"))
+    elif action == "delete":
+        playlists.pop(str(pl["id"]), None)
+        save_playlists()
+        return 200, {"ok": True}
+    elif action == "add":
+        added = []
+        song_id = data.get("songId") or ""
+        book_id = data.get("bookId") or ""
+        file_index = data.get("fileIndex", None)
+        if song_id:
+            song = resolve_song(song_id)
+            if song and song.get("id"):
+                added.append(song["id"])
+        elif book_id and file_index is not None and str(file_index).lstrip("-").isdigit():
+            ids = song_ids_for_item(book_id)
+            i = int(file_index)
+            if 0 <= i < len(ids):
+                added.append(ids[i])
+        elif book_id:
+            added.extend(song_ids_for_item(book_id))
+        if not added:
+            return 400, "Nothing to add"
+        pl.setdefault("songIds", []).extend(added)
+    elif action == "remove":
+        drop_resolved_indexes(pl, [data.get("index")])
+    elif action == "move":
+        try:
+            index = int(data.get("index"))
+            direction = int(data.get("direction"))
+        except (TypeError, ValueError):
+            return 400, "Bad move"
+        positions = resolved_song_positions(pl)
+        j = index + direction
+        if direction not in (-1, 1) or not (0 <= index < len(positions)):
+            return 400, "Bad move"
+        if 0 <= j < len(positions):
+            ids = pl.setdefault("songIds", [])
+            a, b = positions[index], positions[j]
+            ids[a], ids[b] = ids[b], ids[a]
+    else:
+        return 400, "Unknown action"
+    pl["changed"] = iso_now()
+    save_playlists()
+    return 200, web_playlist(pl, username, with_songs=True)
+
 def send_song_file(handler, book, index, download):
     files = book.get("files") or []
     if index is None or index < 0 or index >= len(files):
@@ -2972,6 +3118,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(html.encode())
                 return
 
+            if path.startswith("/playlist/"):
+                pid = path[len("/playlist/"):].split("/")[0]
+                if not playlist_page_id(pid):
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(PLAYLIST_HTML.replace("{{PLAYLIST_ID}}", pid).encode())
+                return
+
             if path == "/users" and username == "admin":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
@@ -2991,6 +3149,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps(collections).encode())
+                return
+
+            if path == "/api/playlists":
+                qs = parse_qs(parsed.query)
+                pid = qs.get("id", [""])[0]
+                if pid:
+                    pl = playlist_get(pid) if playlist_page_id(pid) else None
+                    if not pl or not playlist_visible(pl, username):
+                        self.send_error(404)
+                        return
+                    payload = web_playlist(pl, username, with_songs=True)
+                else:
+                    payload = visible_playlists(username)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(payload).encode())
                 return
 
             if path == "/api/libraries":
@@ -3488,6 +3663,23 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(400)
                 return
 
+            if path == "/api/playlists":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    self.send_error(400)
+                    return
+                status, payload = mutate_playlist(username, data)
+                raw = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain" if isinstance(payload, str) else "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+
             if path == "/api/users" and username == "admin":
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
@@ -3919,6 +4111,7 @@ HTML = '''<!DOCTYPE html>
     <div style="display:flex; flex-direction:column; gap:0.4rem;">
       <button id="nav-collections" onclick="showCollections()" style="text-align:left;">Collections</button>
       <button id="nav-finished" onclick="showFinished()" style="text-align:left;">Finished</button>
+      <button onclick="showPlaylists()" style="text-align:left;">Playlists</button>
       <button onclick="rescan()" style="text-align:left;">Rescan</button>
       <button onclick="clearCovers()" style="text-align:left;">Clear Covers</button>
       <button onclick="toggleTheme()" style="text-align:left;">Theme</button>
@@ -4067,6 +4260,61 @@ async function viewCollection(name) {
   const booksInCol = books.filter(b => ids.includes(b.id));
   document.getElementById('breadcrumb').innerHTML = 'Collections / ' + name;
   document.getElementById('list').innerHTML = booksInCol.length ? booksInCol.map(b => bookCard(b)).join('') : '<p>Empty collection.</p>';
+}
+
+async function showPlaylists() {
+  const r = await fetch('/api/playlists');
+  const lists = await r.json();
+  let html = '<div style="padding:1.5rem; max-width:720px;"><h3>Playlists</h3>';
+  html += '<p style="color:var(--muted);">Yours only, unless you mark one public. Other people can play a public playlist but cannot change it.</p>';
+  html += '<div style="margin:1rem 0; display:flex; gap:0.5rem;"><input id="new-pl" placeholder="New playlist name" style="flex:1; padding:0.45rem 0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);"><button onclick="createPlaylist()">Create</button></div>';
+  if (!lists.length) html += '<p>No playlists yet.</p>';
+  lists.forEach(pl => {
+    const label = esc(pl.name) + ' <span style="color:var(--muted);">(' + pl.songCount + ')</span>';
+    const who = pl.mine ? (pl.public ? 'public' : 'private') : ('by ' + esc(pl.owner));
+    html += '<div style="margin:0.5rem 0; padding:0.7rem; background:var(--card); border:1px solid var(--border); border-radius:8px; cursor:pointer;" onclick="location.href=\\'/playlist/' + pl.id + '\\'">';
+    html += '<strong>' + label + '</strong> <span style="color:var(--muted);">' + who + '</span>';
+    if (pl.mine) html += '<button onclick="event.stopPropagation(); deletePlaylist(\\'' + pl.id + '\\')" style="float:right;">Delete</button>';
+    html += '</div>';
+  });
+  html += '</div>';
+  document.getElementById('list').innerHTML = html;
+  document.getElementById('breadcrumb').innerHTML = 'Playlists';
+  document.getElementById('continue').style.display = 'none';
+}
+
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, function(c) {
+    if (c === '&') return '&' + 'amp;';
+    if (c === '<') return '&' + 'lt;';
+    if (c === '>') return '&' + 'gt;';
+    if (c === String.fromCharCode(34)) return '&' + 'quot;';
+    return '&' + '#39;';
+  });
+}
+
+async function createPlaylist() {
+  const name = document.getElementById('new-pl').value.trim();
+  if (!name) return;
+  const r = await fetch('/api/playlists', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'create', name})
+  });
+  if (!r.ok) { alert(await r.text()); return; }
+  const pl = await r.json();
+  location.href = '/playlist/' + pl.id;
+}
+
+async function deletePlaylist(id) {
+  if (!confirm('Delete this playlist?')) return;
+  const r = await fetch('/api/playlists', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'delete', id})
+  });
+  if (!r.ok) { alert(await r.text()); return; }
+  showPlaylists();
 }
 
 async function showFinished() {
@@ -4298,6 +4546,149 @@ loadFinished().then(function() { load(''); showContinue(); });
 </body>
 </html>'''
 
+PLAYLIST_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playlist</title>
+<style>
+  :root { --bg:#0d0d0f; --fg:#f0f0f2; --card:#18181b; --accent:#5b8def; --border:#2a2a2e; --muted:#9a9aa3; }
+  body.light { --bg:#f7f7f8; --fg:#1a1a1c; --card:#fff; --accent:#3b6fd8; --border:#e4e4e7; --muted:#6b6b76; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; margin:0; background:var(--bg); color:var(--fg); }
+  header { padding:0.9rem 1.25rem; background:var(--card); border-bottom:1px solid var(--border); }
+  header a { color:var(--accent); text-decoration:none; }
+  .wrap { max-width:760px; margin:0 auto; padding:1.25rem; }
+  button { background:transparent; color:var(--fg); border:1px solid var(--border); padding:0.35rem 0.65rem; border-radius:8px; cursor:pointer; }
+  button:hover { background:var(--accent); color:#fff; border-color:var(--accent); }
+  li { list-style:none; margin:0.35rem 0; padding:0.55rem 0.7rem; background:var(--card); border:1px solid var(--border); border-radius:8px; display:flex; gap:0.5rem; align-items:center; }
+  li.active { border-color:var(--accent); }
+  .grow { flex:1; cursor:pointer; }
+  .muted { color:var(--muted); font-size:0.85rem; }
+</style>
+</head>
+<body>
+<header><a href="/">&larr; Library</a></header>
+<div class="wrap">
+  <h1 id="title">Loading...</h1>
+  <div id="owner" class="muted"></div>
+  <div id="tools" style="margin:0.8rem 0; display:flex; gap:0.4rem; flex-wrap:wrap;"></div>
+  <audio id="audio" controls style="width:100%; margin:0.5rem 0 1rem;"></audio>
+  <ul id="tracks" style="padding:0;"></ul>
+</div>
+<script>
+const PID = "{{PLAYLIST_ID}}";
+let pl = null;
+let tracks = [];
+let current = 0;
+const audio = document.getElementById("audio");
+if (localStorage.getItem("theme") === "light") document.body.classList.add("light");
+
+function esc(s) {
+  return String(s || "").replace(/[&<>"']/g, function(c) {
+    if (c === "&") return "&" + "amp;";
+    if (c === "<") return "&" + "lt;";
+    if (c === ">") return "&" + "gt;";
+    if (c === String.fromCharCode(34)) return "&" + "quot;";
+    return "&" + "#39;";
+  });
+}
+
+async function load() {
+  const r = await fetch("/api/playlists?id=" + encodeURIComponent(PID));
+  if (!r.ok) {
+    document.getElementById("title").textContent = "Playlist not found";
+    return;
+  }
+  pl = await r.json();
+  tracks = pl.songs || [];
+  document.getElementById("title").textContent = pl.name || "Playlist";
+  document.title = pl.name || "Playlist";
+  document.getElementById("owner").textContent = pl.mine ? (pl.public ? "Public" : "Private") : ("by " + (pl.owner || ""));
+  const tools = document.getElementById("tools");
+  if (pl.mine) {
+    tools.innerHTML = '<button onclick="renamePlaylist()">Rename</button><button onclick="togglePublic()"></button><button onclick="removePlaylist()">Delete</button>';
+    tools.children[1].textContent = pl.public ? "Make private" : "Make public";
+  } else {
+    tools.innerHTML = "";
+  }
+  render();
+}
+
+function render() {
+  const ul = document.getElementById("tracks");
+  if (!tracks.length) {
+    ul.innerHTML = '<p class="muted">Empty playlist. Open an album or book and use Add to playlist.</p>';
+    return;
+  }
+  ul.innerHTML = tracks.map(function(t, i) {
+    const manage = pl.mine
+      ? '<button onclick="moveTrack(' + i + ',-1)">Up</button><button onclick="moveTrack(' + i + ',1)">Down</button><button onclick="removeTrack(' + i + ')">Remove</button>'
+      : "";
+    return '<li class="' + (i === current ? "active" : "") + '"><div class="grow" onclick="play(' + i + ', true)"><div>' + esc(t.title) + '</div><div class="muted">' + esc(t.artist) + (t.album ? " · " + esc(t.album) : "") + '</div></div>' + manage + "</li>";
+  }).join("");
+}
+
+function play(i, andPlay) {
+  if (i < 0 || i >= tracks.length) return;
+  current = i;
+  const t = tracks[i];
+  audio.src = "/stream/" + encodeURIComponent(t.bookId) + "/" + t.fileIndex;
+  render();
+  if (andPlay) audio.play();
+}
+
+audio.addEventListener("ended", function() {
+  if (current + 1 < tracks.length) play(current + 1, true);
+});
+
+async function post(body) {
+  const r = await fetch("/api/playlists", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) { alert(await r.text()); return null; }
+  return r.json();
+}
+
+async function renamePlaylist() {
+  const name = prompt("Playlist name", pl.name || "");
+  if (!name || !name.trim()) return;
+  if (await post({action:"rename", id:PID, name:name.trim()})) load();
+}
+
+async function togglePublic() {
+  if (await post({action:"public", id:PID, public:!pl.public})) load();
+}
+
+async function removePlaylist() {
+  if (!confirm("Delete this playlist?")) return;
+  const r = await fetch("/api/playlists", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action:"delete", id:PID})
+  });
+  if (!r.ok) { alert(await r.text()); return; }
+  location.href = "/";
+}
+
+async function removeTrack(i) {
+  if (await post({action:"remove", id:PID, index:i})) {
+    if (current >= i && current > 0) current -= 1;
+    load();
+  }
+}
+
+async function moveTrack(i, direction) {
+  if (await post({action:"move", id:PID, index:i, direction:direction})) load();
+}
+
+load();
+</script>
+</body>
+</html>'''
+
 BOOK_HTML = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4400,6 +4791,8 @@ BOOK_HTML = '''<!DOCTYPE html>
       <div style="margin-top:1rem;">
         <button onclick="document.getElementById('edit-meta').style.display='block'">Edit Info / Cover</button>
         <button onclick="addToCollection()" style="margin-left:0.5rem;">Add to Collection</button>
+        <button onclick="addToPlaylist('album')" style="margin-left:0.5rem;">Add to playlist</button>
+        <button onclick="addToPlaylist('track')" style="margin-left:0.5rem;">Add track</button>
         <button id="finish-btn" onclick="toggleFinished()" style="margin-left:0.5rem;">Mark Finished</button>
       </div>
       <div id="edit-meta" style="display:none; margin-top:1rem; background:var(--card); padding:1rem; border-radius:8px;">
@@ -4827,6 +5220,36 @@ async function toggleFinished() {
     body: JSON.stringify({ id: BOOK_ID, action: done ? 'remove' : 'add' })
   });
   refreshFinishBtn();
+}
+
+async function addToPlaylist(mode) {
+  const r = await fetch('/api/playlists');
+  const lists = (await r.json()).filter(p => p.mine);
+  const names = lists.map(p => p.name);
+  const hint = names.length ? '\\nYours: ' + names.join(', ') : '';
+  const choice = prompt('Playlist name' + hint, names[0] || '');
+  if (!choice) return;
+  const name = choice.trim();
+  if (!name) return;
+  let pl = lists.find(p => p.name === name);
+  if (!pl) {
+    const created = await fetch('/api/playlists', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: 'create', name})
+    });
+    if (!created.ok) { alert(await created.text()); return; }
+    pl = await created.json();
+  }
+  const body = {action: 'add', id: pl.id, bookId: BOOK_ID};
+  if (mode === 'track') body.fileIndex = fileIndex;
+  const added = await fetch('/api/playlists', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  if (!added.ok) { alert(await added.text()); return; }
+  alert((mode === 'track' ? 'Track' : 'All tracks') + ' added to "' + name + '"');
 }
 
 async function addToCollection() {

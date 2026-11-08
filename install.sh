@@ -11,3 +11,4 @@ screen -S audiobooks -X quit 2>/dev/null || true
 screen -dmS audiobooks python3 server.py
 echo "Started in screen session audiobooks"
 echo "Attach with: screen -r audiobooks"
+echo "Log: $(pwd)/audiobook.log"

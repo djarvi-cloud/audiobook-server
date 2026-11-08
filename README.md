@@ -31,3 +31,19 @@ git pull
 ```
 
 `users.json`, progress, playlists, covers, and other data files are not in git.
+
+## Logs
+
+Requests, logins, Subsonic calls, and errors are written to `audiobook.log` next to `server.py` and to the screen session. The file rotates at 5 MB and keeps 3 old copies. Passwords and Subsonic tokens are not logged.
+
+```bash
+tail -f ~/audiobook-server/audiobook.log
+```
+
+Cover art, progress saves, pings, and byte-range streams are debug-only. Turn them on with `LOG_LEVEL`:
+
+```bash
+LOG_LEVEL=DEBUG ./install.sh
+```
+
+`LOG_FILE`, `LOG_MAX_BYTES`, and `LOG_BACKUPS` override the log path and rotation.

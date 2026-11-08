@@ -5,7 +5,6 @@ import base64
 import mimetypes
 import secrets
 import time
-import traceback
 import hashlib
 import struct
 import zlib
@@ -14,8 +13,10 @@ import re
 import urllib.request
 import urllib.parse
 import ssl
+import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
@@ -54,7 +55,57 @@ mimetypes.add_type("audio/aac", ".aac")
 AUDIO_EXTS = {".mp3", ".m4b", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac", ".webm"}
 COVER_NAMES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg",
                "folder.png", "album.jpg", "front.jpg"}
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FILE = Path(os.environ.get("LOG_FILE", str(Path(__file__).parent / "audiobook.log")))
+LOG_MAX_BYTES = _env_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
+LOG_BACKUPS = _env_int("LOG_BACKUPS", 3)
+
+log = logging.getLogger("audiobook")
+
+def setup_logging():
+    level = getattr(logging, LOG_LEVEL_NAME, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    log.handlers.clear()
+    log.setLevel(level)
+    log.propagate = False
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+    try:
+        rotating = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES if LOG_MAX_BYTES > 0 else 5 * 1024 * 1024,
+            backupCount=max(LOG_BACKUPS, 0),
+            encoding="utf-8",
+        )
+        rotating.setFormatter(fmt)
+        log.addHandler(rotating)
+    except Exception as exc:
+        log.warning(f"Could not open log file {LOG_FILE}: {exc}")
+
+setup_logging()
+
+# Subsonic clients put the password or token in the query string.
+_SECRET_QUERY = re.compile(
+    r"([?&](?:p|password|pass|t|token|s|salt)=)[^&\s]*",
+    re.IGNORECASE,
+)
+
+def redact(text):
+    if not text:
+        return text
+    return _SECRET_QUERY.sub(r"\1***", str(text))
 
 def hash_password(password: str, salt: bytes = None) -> str:
     if salt is None:
@@ -241,7 +292,7 @@ def daily_backup():
             try:
                 dest.write_bytes(src.read_bytes())
             except Exception as e:
-                print(f"Backup failed for {src.name}: {e}")
+                log.warning(f"Backup failed for {src.name}: {e}")
     try:
         marker.write_text(today)
     except Exception:
@@ -255,7 +306,7 @@ def daily_backup():
         except Exception:
             pass
     _LAST_BACKUP_DAY = today
-    print(f"Daily backup written to {BACKUP_DIR}")
+    log.info(f"Daily backup written to {BACKUP_DIR}")
 
 daily_backup()
 
@@ -371,7 +422,7 @@ def read_local_meta(rel):
         data = json.loads(meta_file.read_text())
         return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(f"Local metadata read failed: {e}")
+        log.warning(f"Local metadata read failed: {e}")
         return {}
 
 def describe_book(author, title, local_meta, file_count):
@@ -395,7 +446,7 @@ def save_remote_cover(url, book_id):
         dest.write_bytes(data)
         return dest
     except Exception as e:
-        print(f"Cover download failed: {e}")
+        log.warning(f"Cover download failed: {e}")
         return None
 
 def fetch_from_isbn(isbn: str):
@@ -434,7 +485,7 @@ def fetch_from_isbn(isbn: str):
             if covers:
                 result["cover_url"] = f"https://covers.openlibrary.org/b/id/{covers[0]}-L.jpg"
     except Exception as e:
-        print(f"Open Library ISBN failed: {e}")
+        log.warning(f"Open Library ISBN failed: {e}")
 
     # Fallback: Google Books if we still need title/author or cover
     if not result["title"] or not result["cover_url"]:
@@ -458,7 +509,7 @@ def fetch_from_isbn(isbn: str):
                     if cover_url:
                         result["cover_url"] = cover_url.replace("zoom=1", "zoom=0").replace("&edge=curl", "")
         except Exception as e:
-            print(f"Google Books ISBN failed: {e}")
+            log.warning(f"Google Books ISBN failed: {e}")
 
     if result["title"] or result["cover_url"]:
         return result
@@ -488,7 +539,7 @@ def fetch_from_isbn(isbn: str):
             cover_url = cover_url.replace("zoom=1", "zoom=0").replace("&edge=curl", "")
         return {"title": title, "author": author, "cover_url": cover_url}
     except Exception as e:
-        print(f"Google Books URL fetch failed: {e}")
+        log.warning(f"Google Books URL fetch failed: {e}")
         return None
     """Try to extract title, author, and cover from an Open Library URL."""
     try:
@@ -528,7 +579,7 @@ def fetch_from_isbn(isbn: str):
 
         return {"title": title, "author": author, "cover_url": cover_url}
     except Exception as e:
-        print(f"Open Library fetch failed: {e}")
+        log.warning(f"Open Library fetch failed: {e}")
         return None
 
 def fetch_cover(author, title, book_id):
@@ -557,7 +608,7 @@ def fetch_cover(author, title, book_id):
                 return cache_path
             cache_path.unlink(missing_ok=True)
     except Exception as e:
-        print(f"Open Library cover failed for {title}: {e}")
+        log.warning(f"Open Library cover failed for {title}: {e}")
 
     # Fallback: Google Books
     try:
@@ -581,7 +632,7 @@ def fetch_cover(author, title, book_id):
                     return cache_path
                 cache_path.unlink(missing_ok=True)
     except Exception as e:
-        print(f"Google Books cover failed for {title}: {e}")
+        log.warning(f"Google Books cover failed for {title}: {e}")
 
     return None
 
@@ -704,7 +755,7 @@ def scan_folder(rel: str = "", scope: str = "books"):
             elif is_sidecar_meta(entry.name):
                 local_meta = entry_rel
     except Exception as e:
-        print(f"Scan error: {e}")
+        log.warning(f"Scan error: {e}")
 
     if files_in_this_dir:
         files_in_this_dir.sort(key=lambda f: f["name"])
@@ -793,7 +844,7 @@ def scan_books_full():
                     "totalSize": sum(f["size"] for f in files)
                 })
         except Exception as e:
-            print(f"Walk error: {e}")
+            log.warning(f"Walk error: {e}")
 
     for i, root in enumerate(library_roots()):
         walk(root, i, "")
@@ -1068,6 +1119,7 @@ def send_subsonic(handler, body, fmt, failed=False):
         handler.wfile.write(data)
 
 def subsonic_error(handler, code, message, fmt):
+    log.warning(f"Subsonic error {code}: {message}")
     send_subsonic(handler, {"error": {"code": int(code), "message": message}}, fmt, failed=True)
 
 def subsonic_params(handler, parsed):
@@ -2013,7 +2065,7 @@ def scan_music_full():
         try:
             entries = sorted(path.iterdir(), key=lambda e: e.name.lower())
         except Exception as e:
-            print(f"Music walk error: {e}")
+            log.warning(f"Music walk error: {e}")
             return
         files = []
         cover = None
@@ -2195,7 +2247,7 @@ def scan_music_folder(rel: str = ""):
                 elif local_cover is None:
                     local_cover = child_rel
     except Exception as e:
-        print(f"Music scan error: {e}")
+        log.warning(f"Music scan error: {e}")
     if files_in_this_dir:
         want = media_id("mal:", rel or "_root_")
         album = next((a for a in get_music_cached() if a.get("id") == want or a.get("path") == (rel or "_root_")), None)
@@ -2715,6 +2767,10 @@ def handle_subsonic(handler, parsed):
         subsonic_error(handler, 40, err, "json" if fmt == "json" else "xml")
         return
     out_fmt = "json" if fmt == "json" else "xml"
+    if method in ("ping", "getCoverArt", "stream", "download", "scrobble"):
+        log.debug(f"Subsonic {method} user={username or '-'}")
+    else:
+        log.info(f"Subsonic {method} user={username or '-'}")
 
     def ok(body=None):
         send_subsonic(handler, body or {}, out_fmt)
@@ -3347,7 +3403,7 @@ class Handler(BaseHTTPRequestHandler):
                                 cache_file.unlink()
                                 cleared += 1
                 except Exception as e:
-                    print("Clear covers error:", e)
+                    log.warning(f"Clear covers error: {e}")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -3374,13 +3430,13 @@ class Handler(BaseHTTPRequestHandler):
 
             if path.startswith("/api/book/"):
                 book_id = path[10:]
-                print(f"Book lookup: {book_id}")
+                log.debug(f"Book lookup: {book_id}")
                 book = get_book_by_id(book_id)
                 if not book:
-                    print(f"Book not found: {book_id}")
+                    log.info(f"Book not found: {book_id}")
                     self.send_error(404)
                     return
-                print(f"Book found: {book.get('name')} ({len(book.get('files', []))} files)")
+                log.debug(f"Book found: {book.get('name')} ({len(book.get('files', []))} files)")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -3450,21 +3506,24 @@ class Handler(BaseHTTPRequestHandler):
                     file_index = 0
                 qs = parse_qs(parsed.query)
                 as_download = qs.get("download", ["0"])[0] == "1"
-                print(f"Stream request: {book_id} file {file_index}")
                 book = get_book_by_id(book_id)
                 if not book or file_index >= len(book["files"]):
-                    print(f"Stream failed: book not found or bad index")
+                    log.warning(f"Stream failed: book not found or bad index ({book_id} file {file_index})")
                     self.send_error(404)
                     return
                 file_path = resolve_item_file(book, book["files"][file_index]["rel"])
                 if file_path is None:
+                    log.warning(f"Stream failed: path refused ({book_id} file {file_index})")
                     self.send_error(403)
                     return
                 if not file_path.is_file():
-                    print(f"Stream failed: file missing {file_path}")
+                    log.warning(f"Stream failed: file missing {file_path}")
                     self.send_error(404)
                     return
-                print(f"Streaming: {file_path}")
+                if self.headers.get("Range"):
+                    log.debug(f"Streaming range: {file_path}")
+                else:
+                    log.info(f"Streaming: {file_path}")
                 self.stream_file(file_path, as_download=as_download)
                 return
 
@@ -3542,7 +3601,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.send_error(404)
         except Exception as e:
-            print("GET error:", traceback.format_exc())
+            log.exception("GET error")
             self.send_error(500, str(e))
 
     def do_POST(self):
@@ -3573,6 +3632,7 @@ class Handler(BaseHTTPRequestHandler):
                             users[user] = hash_password(passwd)
                             save_users(users)
                 if ok:
+                    log.info(f"Login ok user={user} from {self.address_string()}")
                     remember_password(user, passwd)
                     token = secrets.token_urlsafe(32)
                     SESSIONS[token] = {"created": time.time(), "user": user}
@@ -3581,6 +3641,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Set-Cookie", session_cookie(self, token, 604800))
                     self.end_headers()
                 else:
+                    log.warning(f"Login failed user={user or '-'} from {self.address_string()}")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
                     self.end_headers()
@@ -3937,7 +3998,7 @@ class Handler(BaseHTTPRequestHandler):
                             if cache_path.stat().st_size < 1000:
                                 cache_path.unlink(missing_ok=True)
                         except Exception as e:
-                            print(f"Cover download failed: {e}")
+                            log.warning(f"Cover download failed: {e}")
                     metadata[book_id] = meta
                     save_metadata(metadata)
                     # Invalidate book cache so changes show immediately
@@ -3946,13 +4007,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(b"ok")
                 except Exception as e:
-                    print("set-meta error:", e)
+                    log.exception("set-meta error")
                     self.send_error(400)
                 return
 
             self.send_error(404)
         except Exception as e:
-            print("POST error:", traceback.format_exc())
+            log.exception("POST error")
             self.send_error(500)
 
     def stream_file(self, file_path: Path, as_download: bool = False):
@@ -4040,8 +4101,41 @@ class Handler(BaseHTTPRequestHandler):
             start, end = 0, size - 1
         write_range(start, end)
 
+    def log_error(self, format, *args):
+        # send_error already records the status through log_request.
+        return
+
     def log_message(self, format, *args):
-        print(f"{self.address_string()} - {format % args}")
+        try:
+            message = format % args
+        except Exception:
+            message = str(format)
+        path = urlparse(self.path).path
+        status = None
+        if len(args) >= 2:
+            try:
+                status = int(args[1])
+            except (TypeError, ValueError):
+                status = None
+        quiet = (
+            path.startswith("/cover/")
+            or path.startswith("/rest/getCoverArt")
+            or path.startswith("/rest/stream")
+            or path.startswith("/rest/download")
+            or path.startswith("/rest/ping")
+            or path.startswith("/rest/scrobble")
+            or path == "/api/progress"
+        )
+        if path.startswith("/stream/") and self.headers.get("Range"):
+            quiet = True
+        if status is not None and status >= 500:
+            quiet = False
+        log.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "%s %s",
+            self.address_string(),
+            redact(message),
+        )
 
 LOGIN_HTML = '''<!DOCTYPE html>
 <html lang="en">
@@ -5726,13 +5820,14 @@ loadUsers();
 </html>'''
 
 if __name__ == "__main__":
-    print(f"Audiobook server on port {PORT}")
-    print(f"Library: {AUDIO_DIR}")
-    print(f"Music library: {MUSIC_DIR}")
-    print(f"Cover cache: {COVER_CACHE}")
-    print(f"Users file: {USERS_FILE}")
-    print(f"Library exists: {AUDIO_DIR.exists()}")
-    print(f"Music library exists: {MUSIC_DIR.is_dir()}")
+    log.info(f"Audiobook server on port {PORT}")
+    log.info(f"Library: {AUDIO_DIR}")
+    log.info(f"Music library: {MUSIC_DIR}")
+    log.info(f"Cover cache: {COVER_CACHE}")
+    log.info(f"Users file: {USERS_FILE}")
+    log.info(f"Library exists: {AUDIO_DIR.exists()}")
+    log.info(f"Music library exists: {MUSIC_DIR.is_dir()}")
+    log.info(f"Log file: {LOG_FILE} (level {logging.getLevelName(log.level)})")
 
     use_https = os.environ.get("HTTPS", "").lower() in ("1", "true", "yes")
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -5742,7 +5837,7 @@ if __name__ == "__main__":
         key = Path(__file__).parent / "server.key"
         if not cert.exists() or not key.exists():
             import subprocess
-            print("Generating self-signed certificate...")
+            log.info("Generating self-signed certificate...")
             subprocess.check_call([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048",
                 "-keyout", str(key), "-out", str(cert),
@@ -5752,20 +5847,20 @@ if __name__ == "__main__":
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(cert), str(key))
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-        print(f"HTTPS enabled (self-signed). Open https://YOUR_HOST:{PORT}/")
-        print("Browser will warn about the certificate. For a real certificate,")
-        print("leave HTTPS off and use Whatbox Managed Links instead.")
+        log.info(f"HTTPS enabled (self-signed). Open https://YOUR_HOST:{PORT}/")
+        log.info("Browser will warn about the certificate. For a real certificate,")
+        log.info("leave HTTPS off and use Whatbox Managed Links instead.")
     else:
-        print(f"HTTP on port {PORT}")
+        log.info(f"HTTP on port {PORT}")
         if HTTPS_REDIRECT:
-            print(f"Plain HTTP redirects to {HTTPS_REDIRECT}")
-            print(f"Subsonic API: {HTTPS_REDIRECT}/rest")
+            log.info(f"Plain HTTP redirects to {HTTPS_REDIRECT}")
+            log.info(f"Subsonic API: {HTTPS_REDIRECT}/rest")
         else:
-            print("No HTTPS redirect yet. Create https-url.txt next to server.py")
-            print("with one line, your Managed Link, for example:")
-            print("  https://audiobooks.YOUR_SLOT.box.ca")
-        print("For HTTPS: on Whatbox Manage Links, add a custom app named")
-        print(f"  audiobooks  pointing at port {PORT}")
-        print("Then open https://audiobooks.YOUR_SLOT.box.ca/")
+            log.info("No HTTPS redirect yet. Create https-url.txt next to server.py")
+            log.info("with one line, your Managed Link, for example:")
+            log.info("  https://audiobooks.YOUR_SLOT.box.ca")
+        log.info("For HTTPS: on Whatbox Manage Links, add a custom app named")
+        log.info(f"  audiobooks  pointing at port {PORT}")
+        log.info("Then open https://audiobooks.YOUR_SLOT.box.ca/")
 
     httpd.serve_forever()

@@ -17,3 +17,5 @@ covers/
 backups/
 __pycache__/
 *.pyc
+audiobook.log
+audiobook.log.*

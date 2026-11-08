@@ -10,6 +10,7 @@ import hashlib
 import struct
 import zlib
 import random
+import re
 import urllib.request
 import urllib.parse
 import ssl
@@ -20,7 +21,7 @@ from pathlib import Path
 
 PORT = int(os.environ.get("PORT", 17930))
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", Path.home() / "files" / "audiobooks"))
-MUSIC_DIR = Path(os.environ.get("MUSIC_DIR", Path.home() / "files" / "music"))
+MUSIC_DIR = Path(os.environ.get("MUSIC_DIR", Path.home() / "files" / "music")).expanduser()
 USERS_FILE = Path(__file__).parent / "users.json"
 PROGRESS_FILE = Path(__file__).parent / "progress.json"
 METADATA_FILE = Path(__file__).parent / "metadata.json"
@@ -37,12 +38,18 @@ COVER_CACHE = Path(__file__).parent / "covers"
 COVER_CACHE.mkdir(exist_ok=True)
 SESSIONS = {}
 BOOKS_CACHE = {"data": None, "mtime": 0}
+MUSIC_CACHE = {"data": None, "mtime": 0}
 COVER_FETCH_LOCK = threading.Lock()
 COVER_FETCHING = set()
+MUSIC_FOLDER_ID = "mf:music"
 
 # Register m4b MIME type (Python doesn't know it by default)
 mimetypes.add_type("audio/mp4", ".m4b")
 mimetypes.add_type("audio/mp4", ".m4a")
+mimetypes.add_type("audio/flac", ".flac")
+mimetypes.add_type("audio/ogg", ".ogg")
+mimetypes.add_type("audio/ogg", ".opus")
+mimetypes.add_type("audio/aac", ".aac")
 
 AUDIO_EXTS = {".mp3", ".m4b", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac", ".webm"}
 COVER_NAMES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg",
@@ -461,25 +468,14 @@ def load_extra_libraries():
 def save_extra_libraries(paths):
     LIBRARIES_FILE.write_text(json.dumps(paths, indent=2))
 
-def _resolved_dir(raw):
-    try:
-        return Path(raw).expanduser().resolve()
-    except Exception:
-        return Path(raw).expanduser()
-
-def is_music_path(path):
-    return _resolved_dir(path) == _resolved_dir(MUSIC_DIR)
-
 def library_roots():
     roots = []
     seen = set()
-    candidates = [str(AUDIO_DIR)] + load_extra_libraries()
-    music = _resolved_dir(MUSIC_DIR)
-    # Only attach a real music folder, and never shift existing audiobook indexes.
-    if music.is_dir():
-        candidates.append(str(music))
-    for raw in candidates:
-        p = _resolved_dir(raw)
+    for raw in [str(AUDIO_DIR)] + load_extra_libraries():
+        try:
+            p = Path(raw).expanduser().resolve()
+        except Exception:
+            p = Path(raw).expanduser()
         key = str(p)
         if key in seen:
             continue
@@ -522,8 +518,6 @@ def resolve_lib(rel: str):
 def library_list():
     items = []
     for i, root in enumerate(library_roots()):
-        if is_music_path(root):
-            continue
         items.append({
             "path": str(root),
             "name": root.name or str(root),
@@ -535,13 +529,12 @@ def library_list():
 def scan_folder(rel: str = ""):
     """Return folders and books at a given relative path."""
     roots = library_roots()
-    book_indexes = [i for i, root in enumerate(roots) if not is_music_path(root)]
-    if not (rel or "").strip("/") and len(book_indexes) > 1:
-        folders = [{"name": (roots[i].name or str(roots[i])), "path": f"~{i}~"} for i in book_indexes]
+    if not (rel or "").strip("/") and len(roots) > 1:
+        folders = [{"name": (r.name or str(r)), "path": f"~{i}~"} for i, r in enumerate(roots)]
         return {"folders": folders, "books": [], "current": "", "rootName": "Libraries"}
 
     target, root, index = resolve_lib(rel)
-    if target is None or not target.is_dir() or is_music_path(root):
+    if target is None or not target.is_dir():
         return {"folders": [], "books": [], "current": rel, "rootName": ""}
     _, inner = split_lib_path(rel)
 
@@ -662,8 +655,7 @@ def scan_books_full():
                     "files": files,
                     "cover": cover,
                     "path": join_lib_path(index, inner),
-                    "totalSize": sum(f["size"] for f in files),
-                    "kind": "music" if is_music_path(library_roots()[index]) else "audiobook",
+                    "totalSize": sum(f["size"] for f in files)
                 })
         except Exception as e:
             print(f"Walk error: {e}")
@@ -741,8 +733,7 @@ def get_book_by_id(book_id: str):
         "files": files,
         "cover": cover,
         "path": join_lib_path(index, inner),
-        "totalSize": sum(f["size"] for f in files),
-        "kind": "music" if is_music_path(root) else "audiobook",
+        "totalSize": sum(f["size"] for f in files)
     }
 
 def get_books_cached(force=False):
@@ -863,41 +854,6 @@ playlists = load_playlists()
 def save_playlists():
     PLAYLISTS_FILE.write_text(json.dumps(playlists, indent=2))
 
-def playlist_visible(pl, username):
-    if not pl:
-        return False
-    if pl.get("owner") == username:
-        return True
-    return bool(pl.get("public"))
-
-def playlist_songs(pl):
-    songs = []
-    for sid in pl.get("songIds") or []:
-        book, index = find_book(sid)
-        files = (book or {}).get("files") or []
-        if book and index is not None and 0 <= index < len(files):
-            songs.append(song_obj(book, index, files[index]))
-    return songs
-
-def playlist_obj(pl, username, with_entries=False):
-    songs = playlist_songs(pl)
-    obj = {
-        "id": pl["id"],
-        "name": pl.get("name") or "Playlist",
-        "comment": pl.get("comment") or "",
-        "owner": pl.get("owner") or "",
-        "public": bool(pl.get("public")),
-        "songCount": len(songs),
-        "duration": sum(s.get("duration") or 0 for s in songs),
-        "created": pl.get("created") or iso_now(),
-        "changed": pl.get("changed") or iso_now(),
-    }
-    if songs:
-        obj["coverArt"] = songs[0]["coverArt"]
-    if with_entries:
-        obj["entry"] = songs
-    return obj
-
 def iso_now(ts=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts if ts is not None else time.time()))
 
@@ -1004,6 +960,12 @@ def q1(qs, key, default=""):
     vals = qs.get(key) or []
     return vals[0] if vals else default
 
+def q_bool(qs, key, default=None):
+    raw = q1(qs, key, "")
+    if raw == "":
+        return default
+    return str(raw).strip().lower() in ("true", "1", "yes")
+
 def decode_subsonic_password(raw):
     if raw.startswith("enc:"):
         try:
@@ -1082,8 +1044,11 @@ def book_root_index(book):
 def folder_books(folder_id=""):
     books = list(get_books_cached() or [])
     if folder_id.startswith("mf:"):
+        rest = folder_id[3:]
+        if rest == "music":
+            return []
         try:
-            want = int(folder_id[3:])
+            want = int(rest)
         except ValueError:
             return books
         books = [b for b in books if book_root_index(b) == want]
@@ -1119,7 +1084,6 @@ def song_obj(book, index, info):
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     size = int(info.get("size") or 0)
     author = book_author(book)
-    genre = "Music" if book.get("kind") == "music" else "Audiobook"
     return {
         "id": song_key(book, index),
         "parent": album_key(book),
@@ -1138,7 +1102,7 @@ def song_obj(book, index, info):
         "albumId": album_key(book),
         "artistId": artist_key(author),
         "type": "music",
-        "genre": genre,
+        "genre": "Audiobook",
     }
 
 def album_obj(book, with_songs=False):
@@ -1155,7 +1119,7 @@ def album_obj(book, with_songs=False):
         "songCount": len(songs),
         "duration": sum(s["duration"] for s in songs),
         "created": book_created(book),
-        "genre": "Music" if book.get("kind") == "music" else "Audiobook",
+        "genre": "Audiobook",
     }
     if with_songs:
         obj["song"] = songs
@@ -1243,30 +1207,998 @@ def page_slice(items, qs):
         size = 50
     return items[offset:offset + size]
 
-def send_song_file(handler, book, index, download):
-    files = book.get("files") or []
-    if index is None or index < 0 or index >= len(files):
-        handler.send_error(404)
-        return
-    file_path, _root, _idx = resolve_lib(files[index].get("rel") or "")
-    if file_path is None or not file_path.is_file():
-        handler.send_error(404)
-        return
-    handler.stream_file(file_path, as_download=download)
+def audio_mime(name):
+    ext = Path(name).suffix.lower()
+    if ext in (".m4b", ".m4a", ".mp4"):
+        return "audio/mp4"
+    if ext == ".mp3":
+        return "audio/mpeg"
+    if ext == ".flac":
+        return "audio/flac"
+    if ext in (".ogg", ".opus"):
+        return "audio/ogg"
+    if ext == ".aac":
+        return "audio/aac"
+    if ext == ".wav":
+        return "audio/wav"
+    return mimetypes.guess_type(str(name))[0] or "application/octet-stream"
 
-def send_book_zip(handler, book):
+def media_id(prefix, text):
+    return prefix + base64.urlsafe_b64encode((text or "").encode()).decode().rstrip("=")
+
+def media_id_decode(sid, prefix):
+    if not sid.startswith(prefix):
+        return None
+    raw = sid[len(prefix):]
+    raw += "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw).decode()
+    except Exception:
+        return None
+
+def music_dir_ready():
+    try:
+        return MUSIC_DIR.is_dir()
+    except Exception:
+        return False
+
+def music_folder_name():
+    return MUSIC_DIR.name or "Music"
+
+def media_kind(folder_id):
+    fid = (folder_id or "").strip()
+    if fid in (MUSIC_FOLDER_ID, "music") or fid == "mf:music":
+        return "music"
+    if fid.startswith("mf:") and fid[3:] == "music":
+        return "music"
+    if not fid:
+        return "all"
+    return "books"
+
+def include_books(folder_id):
+    return media_kind(folder_id) != "music"
+
+def include_music(folder_id):
+    return music_dir_ready() and media_kind(folder_id) != "books"
+
+TRACK_NAME_RE = re.compile(r"^(\d{1,3})[\s.\-_]+(.+)$")
+
+def parse_track_filename(stem):
+    name = stem or ""
+    m = TRACK_NAME_RE.match(name)
+    if m:
+        try:
+            return int(m.group(1)), m.group(2).strip() or name
+        except ValueError:
+            return None, name
+    return None, name
+
+def _id3_synchsafe(b):
+    return ((b[0] & 0x7F) << 21) | ((b[1] & 0x7F) << 14) | ((b[2] & 0x7F) << 7) | (b[3] & 0x7F)
+
+def _decode_id3_text(data):
+    if not data:
+        return ""
+    enc = data[0]
+    payload = data[1:]
+    try:
+        if enc == 0:
+            return payload.split(b"\x00", 1)[0].decode("latin-1", "replace").strip()
+        if enc == 1:
+            text = payload.decode("utf-16", "replace")
+            return text.split("\x00", 1)[0].strip()
+        if enc == 2:
+            return payload.decode("utf-16-be", "replace").split("\x00", 1)[0].strip()
+        if enc == 3:
+            return payload.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+    except Exception:
+        pass
+    return payload.decode("latin-1", "replace").strip()
+
+def _parse_apic(data):
+    if not data:
+        return None
+    rest = data[1:]
+    z = rest.find(b"\x00")
+    if z < 0:
+        return None
+    mime = rest[:z].decode("latin-1", "replace") or "image/jpeg"
+    rest = rest[z + 1:]
+    if not rest:
+        return None
+    rest = rest[1:]
+    enc = data[0]
+    if enc in (1, 2):
+        z = 0
+        while z + 1 < len(rest):
+            if rest[z:z + 2] == b"\x00\x00":
+                break
+            z += 2
+        img = rest[z + 2:] if z + 1 < len(rest) else b""
+    else:
+        z = rest.find(b"\x00")
+        img = rest[z + 1:] if z >= 0 else rest
+    if len(img) < 24:
+        return None
+    if mime in ("image/jpg", "image/jpeg", "image/png", "image/webp", "image/gif"):
+        return img, mime
+    if img[:3] == b"\xff\xd8\xff":
+        return img, "image/jpeg"
+    if img[:8] == b"\x89PNG\r\n\x1a\n":
+        return img, "image/png"
+    return img, mime or "image/jpeg"
+
+def _parse_vorbis_comment(data):
+    out = {}
+    if len(data) < 8:
+        return out
+    vend_len = struct.unpack("<I", data[0:4])[0]
+    off = 4 + vend_len
+    if off + 4 > len(data):
+        return out
+    n = struct.unpack("<I", data[off:off + 4])[0]
+    off += 4
+    mapping = {
+        "title": "title", "artist": "artist", "album": "album",
+        "tracknumber": "track", "track": "track", "tracktotal": None,
+    }
+    for _ in range(max(0, min(n, 256))):
+        if off + 4 > len(data):
+            break
+        ln = struct.unpack("<I", data[off:off + 4])[0]
+        off += 4
+        if ln < 0 or off + ln > len(data):
+            break
+        rec = data[off:off + ln].decode("utf-8", "replace")
+        off += ln
+        if "=" not in rec:
+            continue
+        k, v = rec.split("=", 1)
+        key = mapping.get(k.strip().lower())
+        if not key or not v:
+            continue
+        if key == "track":
+            try:
+                out["track"] = int(v.split("/")[0].strip())
+            except ValueError:
+                pass
+        else:
+            out.setdefault(key, v.strip())
+    return out
+
+def _read_id3(path, want_picture=False):
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(10)
+            if len(hdr) >= 10 and hdr[:3] == b"ID3":
+                ver = hdr[3]
+                size = _id3_synchsafe(hdr[6:10])
+                tag = f.read(min(size, 2 * 1024 * 1024))
+                off = 0
+                if hdr[5] & 0x40 and len(tag) >= 4:
+                    ext = _id3_synchsafe(tag[0:4]) if ver >= 4 else struct.unpack(">I", tag[0:4])[0]
+                    off = min(max(ext, 4), len(tag))
+                while off + 10 <= len(tag):
+                    fid = tag[off:off + 4]
+                    if fid == b"\x00\x00\x00\x00" or not fid.replace(b"\x00", b""):
+                        break
+                    if not all(65 <= c <= 90 or 48 <= c <= 57 for c in fid):
+                        break
+                    if ver >= 4:
+                        flen = _id3_synchsafe(tag[off + 4:off + 8])
+                    else:
+                        flen = struct.unpack(">I", tag[off + 4:off + 8])[0]
+                    if flen < 0 or off + 10 + flen > len(tag):
+                        break
+                    data = tag[off + 10:off + 10 + flen]
+                    off += 10 + flen
+                    if fid == b"TIT2":
+                        out["title"] = _decode_id3_text(data)
+                    elif fid == b"TPE1":
+                        out["artist"] = _decode_id3_text(data)
+                    elif fid == b"TALB":
+                        out["album"] = _decode_id3_text(data)
+                    elif fid == b"TRCK":
+                        raw = _decode_id3_text(data).split("/")[0].strip()
+                        try:
+                            out["track"] = int(raw)
+                        except ValueError:
+                            pass
+                    elif fid == b"TLEN":
+                        raw = _decode_id3_text(data).strip()
+                        try:
+                            ms = int(raw)
+                            if ms > 0:
+                                out["duration"] = max(1, ms // 1000)
+                        except ValueError:
+                            pass
+                    elif want_picture and fid == b"APIC" and "picture" not in out:
+                        pic = _parse_apic(data)
+                        if pic:
+                            out["picture"] = pic
+                out["_id3_end"] = 10 + size
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            if file_size >= 128:
+                f.seek(file_size - 128)
+                v1 = f.read(128)
+                if v1[:3] == b"TAG":
+                    def t(b):
+                        return b.decode("latin-1", "replace").split("\x00", 1)[0].strip()
+                    out.setdefault("title", t(v1[3:33]))
+                    out.setdefault("artist", t(v1[33:63]))
+                    out.setdefault("album", t(v1[63:93]))
+                    if v1[125] == 0 and v1[126] != 0:
+                        out.setdefault("track", v1[126])
+    except Exception:
+        pass
+    return out
+
+def _mp3_xing_duration(path, start):
+    try:
+        with open(path, "rb") as f:
+            f.seek(start or 0)
+            buf = f.read(8192)
+        sync = buf.find(b"\xff")
+        while sync >= 0 and sync + 4 <= len(buf):
+            b1, b2 = buf[sync], buf[sync + 1]
+            if b1 == 0xFF and (b2 & 0xE0) == 0xE0:
+                break
+            sync = buf.find(b"\xff", sync + 1)
+        else:
+            return 0
+        hdr = buf[sync:sync + 4]
+        ver_id = (hdr[1] >> 3) & 0x03
+        layer = (hdr[1] >> 1) & 0x03
+        sr_idx = (hdr[2] >> 2) & 0x03
+        ch_mode = (hdr[3] >> 6) & 0x03
+        sr_table = {
+            3: [44100, 48000, 32000],
+            2: [22050, 24000, 16000],
+            0: [11025, 12000, 8000],
+        }
+        rates = sr_table.get(ver_id)
+        if not rates or sr_idx > 2:
+            return 0
+        sample_rate = rates[sr_idx]
+        if layer == 1:
+            spf = 384
+        elif layer == 2:
+            spf = 1152
+        else:
+            spf = 1152 if ver_id == 3 else 576
+        if ver_id == 3:
+            side = 32 if ch_mode != 3 else 17
+        else:
+            side = 17 if ch_mode != 3 else 9
+        xoff = sync + 4 + side
+        if xoff + 16 > len(buf):
+            return 0
+        tag = buf[xoff:xoff + 4]
+        if tag not in (b"Xing", b"Info"):
+            return 0
+        flags = struct.unpack(">I", buf[xoff + 4:xoff + 8])[0]
+        if not (flags & 1):
+            return 0
+        frames = struct.unpack(">I", buf[xoff + 8:xoff + 12])[0]
+        if frames and sample_rate:
+            return max(1, int(frames * spf / sample_rate))
+    except Exception:
+        return 0
+    return 0
+
+def _read_flac_meta(path, want_picture=False):
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return out
+            last = False
+            while not last:
+                hdr = f.read(4)
+                if len(hdr) < 4:
+                    break
+                last = bool(hdr[0] & 0x80)
+                btype = hdr[0] & 0x7F
+                ln = int.from_bytes(hdr[1:4], "big")
+                if ln > 8 * 1024 * 1024:
+                    break
+                data = f.read(ln)
+                if len(data) < ln:
+                    break
+                if btype == 0 and len(data) >= 18:
+                    info = int.from_bytes(data[10:18], "big")
+                    sample_rate = (info >> 44) & 0xFFFFF
+                    total = info & 0xFFFFFFFFF
+                    if sample_rate:
+                        out["duration"] = max(1, int(total / sample_rate)) if total else 0
+                elif btype == 4:
+                    out.update(_parse_vorbis_comment(data))
+                elif want_picture and btype == 6 and "picture" not in out and len(data) >= 32:
+                    off = 4
+                    mime_len = struct.unpack(">I", data[off:off + 4])[0]
+                    off += 4
+                    mime = data[off:off + mime_len].decode("latin-1", "replace") if off + mime_len <= len(data) else "image/jpeg"
+                    off += mime_len
+                    if off + 4 > len(data):
+                        continue
+                    desc_len = struct.unpack(">I", data[off:off + 4])[0]
+                    off += 4 + desc_len + 16
+                    if off + 4 > len(data):
+                        continue
+                    pic_len = struct.unpack(">I", data[off:off + 4])[0]
+                    off += 4
+                    pic = data[off:off + pic_len]
+                    if len(pic) >= 24:
+                        out["picture"] = (pic, mime or "image/jpeg")
+    except Exception:
+        pass
+    return out
+
+def _iter_mp4_boxes(data, start, end):
+    off = start
+    while off + 8 <= end:
+        size = struct.unpack(">I", data[off:off + 4])[0]
+        typ = data[off + 4:off + 8]
+        hdr = 8
+        if size == 1 and off + 16 <= end:
+            size = struct.unpack(">Q", data[off + 8:off + 16])[0]
+            hdr = 16
+        elif size == 0:
+            size = end - off
+        if size < hdr or off + size > end:
+            break
+        yield typ, off + hdr, off + size
+        off += size
+
+def _mp4_data_payload(buf, start, end):
+    for typ, s, e in _iter_mp4_boxes(buf, start, end):
+        if typ == b"data" and e - s >= 8:
+            return buf[s + 8:e]
+    return b""
+
+def _read_mp4_meta(path, want_picture=False):
+    out = {}
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            head = f.read(min(size, 512 * 1024))
+            blob = head
+            if b"moov" not in head and size > 512 * 1024:
+                f.seek(max(0, size - 512 * 1024))
+                blob = f.read()
+        end = len(blob)
+        def walk(start, stop, depth=0):
+            if depth > 12:
+                return
+            for typ, s, e in _iter_mp4_boxes(blob, start, stop):
+                if typ in (b"moov", b"udta", b"meta", b"ilst", b"trak", b"mdia"):
+                    ns = s + (4 if typ == b"meta" else 0)
+                    walk(ns, e, depth + 1)
+                elif typ == b"mvhd" and "duration" not in out and e - s >= 20:
+                    version = blob[s]
+                    if version == 1 and e - s >= 32:
+                        timescale = struct.unpack(">I", blob[s + 20:s + 24])[0]
+                        duration = struct.unpack(">Q", blob[s + 24:s + 32])[0]
+                    else:
+                        timescale = struct.unpack(">I", blob[s + 12:s + 16])[0]
+                        duration = struct.unpack(">I", blob[s + 16:s + 20])[0]
+                    if timescale:
+                        out["duration"] = max(1, int(duration / timescale)) if duration else 0
+                elif typ == b"\xa9nam":
+                    val = _mp4_data_payload(blob, s, e).decode("utf-8", "replace").strip()
+                    if val:
+                        out["title"] = val
+                elif typ in (b"\xa9ART", b"aART"):
+                    val = _mp4_data_payload(blob, s, e).decode("utf-8", "replace").strip()
+                    if val:
+                        out.setdefault("artist", val)
+                elif typ == b"\xa9alb":
+                    val = _mp4_data_payload(blob, s, e).decode("utf-8", "replace").strip()
+                    if val:
+                        out["album"] = val
+                elif typ == b"trkn":
+                    payload = _mp4_data_payload(blob, s, e)
+                    if len(payload) >= 4:
+                        out["track"] = struct.unpack(">H", payload[2:4])[0]
+                elif want_picture and typ == b"covr" and "picture" not in out:
+                    payload = _mp4_data_payload(blob, s, e)
+                    if len(payload) >= 24:
+                        mime = "image/png" if payload[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+                        out["picture"] = (payload, mime)
+        walk(0, end)
+    except Exception:
+        pass
+    return out
+
+def _ogg_pages(data):
+    off = 0
+    while True:
+        i = data.find(b"OggS", off)
+        if i < 0 or i + 27 > len(data):
+            break
+        nseg = data[i + 26]
+        if i + 27 + nseg > len(data):
+            break
+        segs = data[i + 27:i + 27 + nseg]
+        body_len = sum(segs)
+        body_start = i + 27 + nseg
+        body_end = body_start + body_len
+        if body_end > len(data):
+            break
+        granule = struct.unpack("<Q", data[i + 6:i + 14])[0]
+        yield granule, data[body_start:body_end]
+        off = body_end
+
+def _read_ogg_meta(path):
+    out = {}
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            head = f.read(min(size, 128 * 1024))
+            tail = b""
+            if size > 128 * 1024:
+                f.seek(max(0, size - 64 * 1024))
+                tail = f.read()
+        sample_rate = 0
+        last_granule = 0
+        is_opus = False
+        packets = []
+        for granule, body in _ogg_pages(head):
+            packets.append(body)
+            last_granule = granule or last_granule
+        for granule, _body in _ogg_pages(tail):
+            last_granule = granule or last_granule
+        for pkt in packets[:4]:
+            if pkt.startswith(b"OpusHead") and len(pkt) >= 16:
+                is_opus = True
+                sample_rate = 48000
+            elif pkt.startswith(b"OpusTags"):
+                out.update(_parse_vorbis_comment(pkt[8:]))
+            elif len(pkt) > 7 and pkt[0] == 1 and pkt[1:7] == b"vorbis":
+                if len(pkt) >= 16:
+                    sample_rate = struct.unpack("<I", pkt[12:16])[0]
+            elif len(pkt) > 7 and pkt[0] == 3 and pkt[1:7] == b"vorbis":
+                out.update(_parse_vorbis_comment(pkt[7:]))
+        if last_granule and (sample_rate or is_opus):
+            rate = 48000 if is_opus else sample_rate
+            if rate:
+                out["duration"] = max(1, int(last_granule / rate))
+    except Exception:
+        pass
+    return out
+
+def _read_wav_meta(path):
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(12)
+            if len(hdr) < 12 or hdr[0:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+                return out
+            byte_rate = 0
+            data_size = 0
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    break
+                cid, clen = chunk[0:4], struct.unpack("<I", chunk[4:8])[0]
+                if cid == b"fmt " and clen >= 16:
+                    fmt = f.read(clen)
+                    if len(fmt) >= 16:
+                        byte_rate = struct.unpack("<I", fmt[8:12])[0]
+                    continue
+                if cid == b"data":
+                    data_size = clen
+                    break
+                f.seek(clen + (clen & 1), os.SEEK_CUR)
+            if byte_rate:
+                out["duration"] = max(1, int(data_size / byte_rate)) if data_size else 0
+    except Exception:
+        pass
+    return out
+
+def read_audio_meta(path, want_picture=False):
+    result = {"title": None, "artist": None, "album": None, "track": None, "duration": 0}
+    if want_picture:
+        result["picture"] = None
+    ext = path.suffix.lower()
+    try:
+        if ext == ".mp3":
+            got = _read_id3(path, want_picture=want_picture)
+            result.update({k: v for k, v in got.items() if not k.startswith("_") and v})
+            if not result.get("duration"):
+                result["duration"] = _mp3_xing_duration(path, got.get("_id3_end") or 0)
+        elif ext == ".flac":
+            result.update({k: v for k, v in _read_flac_meta(path, want_picture=want_picture).items() if v})
+        elif ext in (".m4a", ".m4b", ".mp4", ".aac"):
+            result.update({k: v for k, v in _read_mp4_meta(path, want_picture=want_picture).items() if v})
+        elif ext in (".ogg", ".opus"):
+            result.update({k: v for k, v in _read_ogg_meta(path).items() if v})
+        elif ext == ".wav":
+            result.update({k: v for k, v in _read_wav_meta(path).items() if v})
+    except Exception:
+        pass
+    if not result.get("duration"):
+        try:
+            result["duration"] = guess_duration(path.stat().st_size)
+        except Exception:
+            result["duration"] = 0
+    return result
+
+def extract_embedded_art(path):
+    try:
+        meta = read_audio_meta(path, want_picture=True)
+        pic = meta.get("picture")
+        if pic and pic[0]:
+            return pic
+    except Exception:
+        pass
+    return None
+
+def resolve_music(rel):
+    if not music_dir_ready():
+        return None
+    rel = (rel or "").replace("\\", "/").strip("/")
+    if ".." in Path(rel).parts:
+        return None
+    try:
+        root = MUSIC_DIR.resolve()
+        target = (root / rel).resolve() if rel else root
+    except Exception:
+        return None
+    if target != root and root not in target.parents:
+        return None
+    return target
+
+def music_artist_key(name):
+    return media_id("mar:", name or "Unknown")
+
+def music_artist_name(aid):
+    return media_id_decode(aid, "mar:")
+
+def _dir_has_direct_audio(path):
+    try:
+        for entry in path.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if entry.is_file() and entry.suffix.lower() in AUDIO_EXTS:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _is_artist_folder(path):
+    try:
+        has_direct = False
+        has_album = False
+        for entry in path.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if entry.is_file() and entry.suffix.lower() in AUDIO_EXTS:
+                has_direct = True
+                break
+            if entry.is_dir() and _dir_has_direct_audio(entry):
+                has_album = True
+        return (not has_direct) and has_album
+    except Exception:
+        return False
+
+def _collect_dir_audio(path, rel):
+    files = []
+    cover = None
+    try:
+        entries = sorted(path.iterdir(), key=lambda e: e.name.lower())
+    except Exception:
+        return files, cover
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        child_rel = f"{rel}/{entry.name}" if rel else entry.name
+        if entry.is_dir():
+            nested, nested_cover = _collect_dir_audio(entry, child_rel)
+            files.extend(nested)
+            if nested_cover and cover is None:
+                cover = nested_cover
+        elif entry.suffix.lower() in AUDIO_EXTS:
+            try:
+                files.append({"name": entry.name, "rel": child_rel, "size": entry.stat().st_size, "path": entry})
+            except Exception:
+                continue
+        elif entry.suffix.lower() in IMAGE_EXTS:
+            if entry.name.lower() in COVER_NAMES:
+                cover = child_rel
+            elif cover is None:
+                cover = child_rel
+    files.sort(key=lambda f: f["name"].lower())
+    return files, cover
+
+def _music_file_info(entry, album_name, album_artist):
+    path = entry["path"]
+    meta = read_audio_meta(path)
+    fn_track, fn_title = parse_track_filename(Path(entry["name"]).stem)
+    title = meta.get("title") or fn_title
+    artist = meta.get("artist") or album_artist
+    album = meta.get("album") or album_name
+    track = meta.get("track") or fn_track or 0
+    duration = int(meta.get("duration") or 0)
+    size = int(entry.get("size") or 0)
+    bitrate = 128
+    if duration > 0 and size > 0:
+        bitrate = max(32, int(size * 8 / duration / 1000))
+    return {
+        "id": media_id("ms:", entry["rel"]),
+        "name": entry["name"],
+        "rel": entry["rel"],
+        "size": size,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "track": int(track) if track else 0,
+        "duration": duration,
+        "bitRate": bitrate,
+        "contentType": audio_mime(entry["name"]),
+        "suffix": Path(entry["name"]).suffix.lower().lstrip(".") or "mp3",
+    }
+
+def _add_music_album(albums, path, rel, artist, album_name, files, cover):
+    if not files:
+        return
+    created = iso_now()
+    try:
+        created = iso_now(path.stat().st_mtime)
+    except Exception:
+        pass
+    infos = [_music_file_info(f, album_name, artist) for f in files]
+    for i, info in enumerate(infos):
+        if not info.get("track"):
+            info["track"] = i + 1
+    albums.append({
+        "id": media_id("mal:", rel or album_name),
+        "path": rel,
+        "name": album_name,
+        "artist": artist or "Unknown",
+        "artistId": music_artist_key(artist or "Unknown"),
+        "cover": cover,
+        "created": created,
+        "files": infos,
+    })
+
+def scan_music_full():
+    albums = []
+    if not music_dir_ready():
+        return albums
+
+    def walk(path, rel, artist=None):
+        try:
+            entries = sorted(path.iterdir(), key=lambda e: e.name.lower())
+        except Exception as e:
+            print(f"Music walk error: {e}")
+            return
+        files = []
+        cover = None
+        dirs = []
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            child_rel = f"{rel}/{entry.name}" if rel else entry.name
+            if entry.is_dir():
+                dirs.append((entry, child_rel))
+            elif entry.suffix.lower() in AUDIO_EXTS:
+                try:
+                    files.append({"name": entry.name, "rel": child_rel, "size": entry.stat().st_size, "path": entry})
+                except Exception:
+                    continue
+            elif entry.suffix.lower() in IMAGE_EXTS:
+                if entry.name.lower() in COVER_NAMES:
+                    cover = child_rel
+                elif cover is None:
+                    cover = child_rel
+        if files:
+            folder_name = Path(rel).name if rel else "Music"
+            album_artist = artist
+            album_name = folder_name
+            if not rel:
+                album_artist = album_artist or "Unknown"
+                album_name = "Music"
+            elif not album_artist:
+                parsed_artist, parsed_title = parse_name(folder_name)
+                if parsed_artist:
+                    album_artist = parsed_artist
+                    album_name = parsed_title or folder_name
+                else:
+                    album_artist = "Unknown"
+            files.sort(key=lambda f: f["name"].lower())
+            _add_music_album(albums, path, rel or "_root_", album_artist, album_name, files, cover)
+        treat_as_artist = (path != MUSIC_DIR and artist is None and _is_artist_folder(path))
+        next_artist = path.name if treat_as_artist else artist
+        for d, child_rel in dirs:
+            if treat_as_artist:
+                nested_files, nested_cover = _collect_dir_audio(d, child_rel)
+                if nested_files:
+                    _add_music_album(albums, d, child_rel, next_artist, d.name, nested_files, nested_cover)
+                else:
+                    walk(d, child_rel, next_artist)
+            else:
+                walk(d, child_rel, next_artist)
+
+    walk(MUSIC_DIR, "", None)
+    return albums
+
+def get_music_cached(force=False):
+    if not music_dir_ready():
+        MUSIC_CACHE["data"] = []
+        MUSIC_CACHE["mtime"] = 0
+        return []
+    try:
+        current_mtime = MUSIC_DIR.stat().st_mtime
+    except Exception:
+        current_mtime = 0
+    if force or MUSIC_CACHE["data"] is None or current_mtime != MUSIC_CACHE.get("mtime", 0):
+        MUSIC_CACHE["data"] = scan_music_full()
+        MUSIC_CACHE["mtime"] = current_mtime
+        MUSIC_CACHE["ts"] = time.time()
+    return MUSIC_CACHE["data"] or []
+
+def music_albums(folder_id=""):
+    if not include_music(folder_id):
+        return []
+    return get_music_cached()
+
+def music_album_by_id(sid):
+    if sid.startswith("ms:"):
+        album, _info = music_song_by_id(sid)
+        return album
+    if not sid.startswith("mal:"):
+        return None
+    for album in get_music_cached():
+        if album["id"] == sid:
+            return album
+    rel = media_id_decode(sid, "mal:")
+    if rel:
+        for album in get_music_cached():
+            if album.get("path") == rel:
+                return album
+    return None
+
+def music_song_by_id(sid):
+    rel = media_id_decode(sid, "ms:")
+    if rel is None:
+        return None, None
+    for album in get_music_cached():
+        for info in album.get("files") or []:
+            if info.get("id") == sid or info.get("rel") == rel:
+                return album, info
+    return None, None
+
+def music_song_obj(album, info):
+    ext = info.get("suffix") or Path(info.get("name") or "").suffix.lower().lstrip(".")
+    return {
+        "id": info["id"],
+        "parent": album["id"],
+        "isDir": False,
+        "title": info.get("title") or Path(info.get("name") or "Track").stem,
+        "album": info.get("album") or album.get("name") or "Untitled",
+        "artist": info.get("artist") or album.get("artist") or "Unknown",
+        "track": int(info.get("track") or 0),
+        "coverArt": album["id"],
+        "size": int(info.get("size") or 0),
+        "contentType": info.get("contentType") or audio_mime(info.get("name") or ""),
+        "suffix": ext or "mp3",
+        "duration": int(info.get("duration") or 0),
+        "bitRate": int(info.get("bitRate") or 128),
+        "path": info.get("rel") or info.get("name") or "",
+        "albumId": album["id"],
+        "artistId": album.get("artistId") or music_artist_key(album.get("artist")),
+        "type": "music",
+    }
+
+def music_album_obj(album, with_songs=False):
+    songs = [music_song_obj(album, f) for f in album.get("files") or []]
+    obj = {
+        "id": album["id"],
+        "name": album.get("name") or "Untitled",
+        "title": album.get("name") or "Untitled",
+        "album": album.get("name") or "Untitled",
+        "artist": album.get("artist") or "Unknown",
+        "artistId": album.get("artistId") or music_artist_key(album.get("artist")),
+        "coverArt": album["id"],
+        "songCount": len(songs),
+        "duration": sum(int(s.get("duration") or 0) for s in songs),
+        "created": album.get("created") or iso_now(),
+    }
+    if with_songs:
+        obj["song"] = songs
+    return obj
+
+def music_artists_from(albums=None):
+    grouped = {}
+    for album in albums if albums is not None else get_music_cached():
+        grouped.setdefault(album.get("artist") or "Unknown", []).append(album)
+    return grouped
+
+def selected_books(folder_id):
+    if not include_books(folder_id):
+        return []
+    return folder_books("" if media_kind(folder_id) == "all" else folder_id)
+
+def artist_index_entries(folder_id=""):
     entries = []
-    for info in book.get("files") or []:
-        path, _root, _idx = resolve_lib(info.get("rel") or "")
+    if include_books(folder_id):
+        grouped = artists_from(selected_books(folder_id))
+        for name, items in grouped.items():
+            entries.append({"id": artist_key(name), "name": name, "albumCount": len(items)})
+    if include_music(folder_id):
+        grouped = music_artists_from(music_albums(folder_id))
+        for name, items in grouped.items():
+            entries.append({"id": music_artist_key(name), "name": name, "albumCount": len(items)})
+    return entries
+
+def grouped_artist_indexes(folder_id=""):
+    letters = {}
+    for artist in artist_index_entries(folder_id):
+        label = sort_key_name(artist["name"]).strip()[:1].upper() or "#"
+        if not label.isalpha():
+            label = "#"
+        letters.setdefault(label, []).append(artist)
+    indexes = []
+    for label in sorted(letters):
+        artists = sorted(letters[label], key=lambda a: sort_key_name(a["name"]).lower())
+        indexes.append({"name": label, "artist": artists})
+    return indexes
+
+def listed_album_objs(folder_id=""):
+    items = []
+    if include_books(folder_id):
+        for book in selected_books(folder_id):
+            items.append(("book", book, album_obj(book)))
+    if include_music(folder_id):
+        for album in music_albums(folder_id):
+            items.append(("music", album, music_album_obj(album)))
+    return items
+
+def listed_songs(folder_id=""):
+    songs = []
+    if include_books(folder_id):
+        for book in selected_books(folder_id):
+            for i, info in enumerate(book.get("files") or []):
+                songs.append(song_obj(book, i, info))
+    if include_music(folder_id):
+        for album in music_albums(folder_id):
+            for info in album.get("files") or []:
+                songs.append(music_song_obj(album, info))
+    return songs
+
+def resolve_song(sid):
+    if not sid:
+        return None
+    if sid.startswith("ms:"):
+        album, info = music_song_by_id(sid)
+        if album and info:
+            return music_song_obj(album, info)
+        return None
+    book, index = find_book(sid)
+    if book and index is not None and 0 <= index < len(book.get("files") or []):
+        return song_obj(book, index, book["files"][index])
+    return None
+
+def music_cover_file(album, song_info=None):
+    if album and album.get("cover"):
+        path = resolve_music(album["cover"])
         if path and path.is_file():
-            entries.append((info.get("name") or path.name, path, path.stat().st_size))
-    if not entries:
+            return path
+    files = []
+    if song_info:
+        files.append(song_info)
+    if album:
+        files.extend(album.get("files") or [])
+    seen = set()
+    for info in files:
+        rel = info.get("rel")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        path = resolve_music(rel)
+        if path and path.is_file():
+            pic = extract_embedded_art(path)
+            if pic:
+                cache = COVER_CACHE / ("m-" + hashlib.sha1(rel.encode()).hexdigest()[:16] + ".img")
+                try:
+                    if not cache.exists() or cache.stat().st_size != len(pic[0]):
+                        cache.write_bytes(pic[0])
+                    return cache
+                except Exception:
+                    return None
+    return None
+
+def send_image_bytes(handler, data, mime):
+    handler.send_response(200)
+    handler.send_header("Content-Type", mime or "image/jpeg")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "public, max-age=86400")
+    handler.end_headers()
+    if handler.command != "HEAD":
+        handler.wfile.write(data)
+
+def cover_mime_for(path):
+    ext = path.suffix.lower()
+    if ext == ".png":
+        return "image/png"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".gif":
+        return "image/gif"
+    try:
+        head = path.read_bytes()[:16]
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if head[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if head[:4] == b"RIFF":
+            return "image/webp"
+    except Exception:
+        pass
+    return "image/jpeg"
+
+def send_cover_art(handler, sid):
+    if sid.startswith("pl:"):
+        pl = playlists.get(sid[3:]) or playlists.get(sid)
+        if not pl:
+            handler.send_error(404)
+            return
+        for song_id in pl.get("songIds") or []:
+            if send_cover_art_media(handler, song_id, missing_ok=True):
+                return
         handler.send_error(404)
         return
-    names = []
+    if not send_cover_art_media(handler, sid, missing_ok=True):
+        handler.send_error(404)
+
+def send_cover_art_media(handler, sid, missing_ok=False):
+    if sid.startswith("mar:"):
+        name = music_artist_name(sid)
+        albums = [a for a in get_music_cached() if (a.get("artist") or "Unknown") == name] if name else []
+        for album in albums:
+            path = music_cover_file(album)
+            if path and path.is_file():
+                send_image_bytes(handler, path.read_bytes(), cover_mime_for(path))
+                return True
+        return False
+    if sid.startswith("mal:") or sid.startswith("ms:"):
+        if sid.startswith("mal:"):
+            album, info = music_album_by_id(sid), None
+        else:
+            album, info = music_song_by_id(sid)
+        if not album:
+            return False
+        path = music_cover_file(album, info)
+        if path and path.is_file():
+            send_image_bytes(handler, path.read_bytes(), cover_mime_for(path))
+            return True
+        return False
+    book, _idx = find_book(sid)
+    if book:
+        path = cover_file(book)
+        if path:
+            send_image_bytes(handler, path.read_bytes(), cover_mime_for(path) if hasattr(path, "suffix") else "image/jpeg")
+            return True
+    if sid.startswith("ar:"):
+        name = artist_name(sid)
+        books = [b for b in get_books_cached() or [] if book_author(b) == name] if name else []
+        for book in books:
+            path = cover_file(book)
+            if path:
+                send_image_bytes(handler, path.read_bytes(), cover_mime_for(path))
+                return True
+    return False if missing_ok else False
+
+def send_zip_paths(handler, title, packed):
+    if not packed:
+        handler.send_error(404)
+        return
     used = set()
-    packed = []
-    for name, path, size in entries:
+    out = []
+    for name, path, size in packed:
         arc = name.replace("\\", "/").split("/")[-1] or "audio"
         base = arc
         n = 2
@@ -1276,17 +2208,17 @@ def send_book_zip(handler, book):
             arc = f"{stem}-{n}{ext}"
             n += 1
         used.add(arc)
-        names.append(arc.encode())
-        packed.append((arc, path, size))
+        out.append((arc, path, size))
+    packed = out
     total = 22
     for arc, _path, size in packed:
         nlen = len(arc.encode())
         total += 30 + nlen + size + 16 + 46 + nlen
-    title = (book.get("name") or "book").replace('"', "")
+    safe_title = (title or "album").replace('"', "")
     handler.send_response(200)
     handler.send_header("Content-Type", "application/zip")
     handler.send_header("Content-Length", str(total))
-    handler.send_header("Content-Disposition", f'attachment; filename="{title}.zip"')
+    handler.send_header("Content-Disposition", f'attachment; filename="{safe_title}.zip"')
     handler.end_headers()
     if handler.command == "HEAD":
         return
@@ -1297,7 +2229,6 @@ def send_book_zip(handler, book):
     central = []
     for arc, path, size in packed:
         name_b = arc.encode()
-        crc = 0
         handler.wfile.write(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0x0008, 0, dos_time, dos_date, 0, 0, 0, len(name_b), 0))
         handler.wfile.write(name_b)
         hasher = zlib.crc32(b"")
@@ -1320,6 +2251,96 @@ def send_book_zip(handler, book):
         handler.wfile.write(name_b)
         offset += 46 + len(name_b)
     handler.wfile.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(central), len(central), offset - central_start, central_start, 0))
+
+def send_music_album_zip(handler, album):
+    entries = []
+    for info in album.get("files") or []:
+        path = resolve_music(info.get("rel") or "")
+        if path and path.is_file():
+            entries.append((info.get("name") or path.name, path, path.stat().st_size))
+    send_zip_paths(handler, album.get("name") or "album", entries)
+
+def next_playlist_id():
+    n = 0
+    for key in playlists:
+        try:
+            n = max(n, int(key))
+        except ValueError:
+            pass
+    return str(n + 1)
+
+def playlist_visible(pl, username):
+    return (pl.get("owner") == username) or bool(pl.get("public"))
+
+def playlist_owned(pl, username):
+    return pl.get("owner") == username
+
+def playlist_get(pid):
+    if pid is None or pid == "":
+        return None
+    return playlists.get(str(pid))
+
+def playlist_entries(pl):
+    entries = []
+    for sid in pl.get("songIds") or []:
+        song = resolve_song(sid)
+        if song:
+            entries.append(song)
+    return entries
+
+def playlist_obj(pl, with_entries=False):
+    entries = playlist_entries(pl)
+    obj = {
+        "id": str(pl.get("id")),
+        "name": pl.get("name") or "Playlist",
+        "comment": pl.get("comment") or "",
+        "owner": pl.get("owner") or "",
+        "public": bool(pl.get("public")),
+        "songCount": len(entries),
+        "duration": sum(int(s.get("duration") or 0) for s in entries),
+        "created": pl.get("created") or iso_now(),
+        "changed": pl.get("changed") or iso_now(),
+        "coverArt": "pl:" + str(pl.get("id")),
+    }
+    if with_entries:
+        obj["entry"] = entries
+    return obj
+
+def new_playlist(username, name, song_ids):
+    pid = next_playlist_id()
+    now = iso_now()
+    pl = {
+        "id": pid,
+        "name": name or "Playlist",
+        "comment": "",
+        "owner": username,
+        "public": False,
+        "created": now,
+        "changed": now,
+        "songIds": list(song_ids or []),
+    }
+    playlists[pid] = pl
+    save_playlists()
+    return pl
+
+def send_song_file(handler, book, index, download):
+    files = book.get("files") or []
+    if index is None or index < 0 or index >= len(files):
+        handler.send_error(404)
+        return
+    file_path, _root, _idx = resolve_lib(files[index].get("rel") or "")
+    if file_path is None or not file_path.is_file():
+        handler.send_error(404)
+        return
+    handler.stream_file(file_path, as_download=download)
+
+def send_book_zip(handler, book):
+    entries = []
+    for info in book.get("files") or []:
+        path, _root, _idx = resolve_lib(info.get("rel") or "")
+        if path and path.is_file():
+            entries.append((info.get("name") or path.name, path, path.stat().st_size))
+    send_zip_paths(handler, book.get("name") or "book", entries)
 
 def handle_subsonic(handler, parsed):
     method = parsed.path[len("/rest/"):]
@@ -1360,33 +2381,44 @@ def handle_subsonic(handler, parsed):
         folders = []
         for i, root in enumerate(library_roots()):
             folders.append({"id": f"mf:{i}", "name": root.name or str(root)})
+        if music_dir_ready():
+            folders.append({"id": MUSIC_FOLDER_ID, "name": music_folder_name()})
         ok({"musicFolders": {"musicFolder": folders}})
         return
     if method == "getIndexes":
-        books = folder_books(q1(qs, "musicFolderId"))
-        grouped = artists_from(books)
-        letters = {}
-        for name, items in grouped.items():
-            label = sort_key_name(name).strip()[:1].upper()
-            if not label.isalpha():
-                label = "#"
-            letters.setdefault(label, []).append((name, items))
-        indexes = []
-        for label in sorted(letters):
-            artists = []
-            for name, items in sorted(letters[label], key=lambda pair: sort_key_name(pair[0]).lower()):
-                artists.append({"id": artist_key(name), "name": name, "albumCount": len(items)})
-            indexes.append({"name": label, "artist": artists})
-        ok({"indexes": {"lastModified": int(time.time() * 1000), "index": indexes}})
+        ok({"indexes": {"lastModified": int(time.time() * 1000), "index": grouped_artist_indexes(q1(qs, "musicFolderId"))}})
         return
     if method == "getMusicDirectory":
         mid = q1(qs, "id")
+        if mid == MUSIC_FOLDER_ID or mid == "mf:music":
+            children = []
+            for name, items in sorted(music_artists_from().items(), key=lambda pair: sort_key_name(pair[0]).lower()):
+                children.append({"id": music_artist_key(name), "isDir": True, "title": name, "artist": name, "albumCount": len(items)})
+            ok({"directory": {"id": MUSIC_FOLDER_ID, "name": music_folder_name(), "child": children}})
+            return
         if mid.startswith("mf:"):
             books = folder_books(mid)
             children = []
             for name in sorted(artists_from(books), key=lambda n: sort_key_name(n).lower()):
                 children.append({"id": artist_key(name), "isDir": True, "title": name, "artist": name})
             ok({"directory": {"id": mid, "name": "Library", "child": children}})
+            return
+        if mid.startswith("mar:"):
+            name = music_artist_name(mid) or "Unknown"
+            albums = [a for a in get_music_cached() if (a.get("artist") or "Unknown") == name]
+            children = []
+            for album in sorted(albums, key=lambda a: (a.get("name") or "").lower()):
+                obj = music_album_obj(album)
+                children.append({"id": obj["id"], "parent": mid, "isDir": True, "title": obj["name"], "artist": name, "coverArt": obj["coverArt"]})
+            ok({"directory": {"id": mid, "name": name, "parent": MUSIC_FOLDER_ID, "child": children}})
+            return
+        if mid.startswith("mal:"):
+            album = music_album_by_id(mid)
+            if not album:
+                subsonic_error(handler, 70, "Not found", out_fmt)
+                return
+            songs = [music_song_obj(album, f) for f in album.get("files") or []]
+            ok({"directory": {"id": album["id"], "parent": album.get("artistId"), "name": album.get("name") or "Untitled", "child": songs}})
             return
         if mid.startswith("ar:"):
             name = artist_name(mid) or "Unknown"
@@ -1405,19 +2437,22 @@ def handle_subsonic(handler, parsed):
         ok({"directory": {"id": album_key(book), "parent": artist_key(book_author(book)), "name": book.get("name") or "Untitled", "child": songs}})
         return
     if method == "getArtists":
-        books = folder_books(q1(qs, "musicFolderId"))
-        grouped = artists_from(books)
-        letters = {}
-        for name, items in grouped.items():
-            label = sort_key_name(name).strip()[:1].upper() or "#"
-            if not label.isalpha():
-                label = "#"
-            letters.setdefault(label, []).append({"id": artist_key(name), "name": name, "albumCount": len(items)})
-        indexes = [{"name": label, "artist": sorted(letters[label], key=lambda a: a["name"].lower())} for label in sorted(letters)]
-        ok({"artists": {"index": indexes}})
+        ok({"artists": {"index": grouped_artist_indexes(q1(qs, "musicFolderId"))}})
         return
     if method == "getArtist":
-        name = artist_name(q1(qs, "id"))
+        aid = q1(qs, "id")
+        if aid.startswith("mar:"):
+            name = music_artist_name(aid)
+            if not name:
+                subsonic_error(handler, 70, "Not found", out_fmt)
+                return
+            albums = [music_album_obj(a) for a in sorted(
+                [a for a in get_music_cached() if (a.get("artist") or "Unknown") == name],
+                key=lambda a: (a.get("name") or "").lower()
+            )]
+            ok({"artist": {"id": music_artist_key(name), "name": name, "albumCount": len(albums), "album": albums}})
+            return
+        name = artist_name(aid)
         if not name:
             subsonic_error(handler, 70, "Not found", out_fmt)
             return
@@ -1426,47 +2461,61 @@ def handle_subsonic(handler, parsed):
         ok({"artist": {"id": artist_key(name), "name": name, "albumCount": len(albums), "album": albums}})
         return
     if method == "getAlbum":
-        book, _idx = find_book(q1(qs, "id"))
+        sid = q1(qs, "id")
+        if sid.startswith("mal:") or sid.startswith("ms:"):
+            album = music_album_by_id(sid)
+            if not album:
+                subsonic_error(handler, 70, "Not found", out_fmt)
+                return
+            ok({"album": music_album_obj(album, with_songs=True)})
+            return
+        book, _idx = find_book(sid)
         if not book:
             subsonic_error(handler, 70, "Not found", out_fmt)
             return
         ok({"album": album_obj(book, with_songs=True)})
         return
     if method == "getSong":
-        book, index = find_book(q1(qs, "id"))
-        if not book or index is None or index >= len(book.get("files") or []):
+        sid = q1(qs, "id")
+        song = resolve_song(sid)
+        if not song:
             subsonic_error(handler, 70, "Not found", out_fmt)
             return
-        ok({"song": song_obj(book, index, book["files"][index])})
+        ok({"song": song})
         return
     if method in ("getAlbumList", "getAlbumList2"):
-        books = folder_books(q1(qs, "musicFolderId"))
+        folder_id = q1(qs, "musicFolderId")
         kind = q1(qs, "type", "newest")
-        if kind == "recent":
-            def recent_key(book):
-                saved = (progress.get(username) or {}).get(book["id"]) or {}
-                return saved.get("updated") or 0
-            books = sorted(books, key=recent_key, reverse=True)
+        pairs = listed_album_objs(folder_id)
+        if kind == "starred":
+            pairs = []
+        elif kind == "recent":
+            def recent_key(pair):
+                kind_name, src, _obj = pair
+                if kind_name == "book":
+                    saved = (progress.get(username) or {}).get(src["id"]) or {}
+                    return saved.get("updated") or 0
+                try:
+                    path = resolve_music(src.get("path") or "")
+                    return int(path.stat().st_mtime * 1000) if path else 0
+                except Exception:
+                    return 0
+            pairs = sorted(pairs, key=recent_key, reverse=True)
         elif kind == "alphabeticalByArtist":
-            books = sorted(books, key=lambda b: (book_author(b).lower(), (b.get("name") or "").lower()))
+            pairs = sorted(pairs, key=lambda p: ((p[2].get("artist") or "").lower(), (p[2].get("name") or "").lower()))
         elif kind == "alphabeticalByName":
-            books = sorted(books, key=lambda b: (b.get("name") or "").lower())
+            pairs = sorted(pairs, key=lambda p: (p[2].get("name") or "").lower())
         elif kind == "random":
-            books = list(books)
-            random.shuffle(books)
-        elif kind == "starred":
-            books = []
+            pairs = list(pairs)
+            random.shuffle(pairs)
         else:
-            books = sorted(books, key=book_created, reverse=True)
-        albums = [album_obj(b) for b in page_slice(books, qs)]
+            pairs = sorted(pairs, key=lambda p: p[2].get("created") or "", reverse=True)
+        albums = [p[2] for p in page_slice(pairs, qs)]
         key = "albumList2" if method == "getAlbumList2" else "albumList"
         ok({key: {"album": albums}})
         return
     if method == "getRandomSongs":
-        songs = []
-        for book in folder_books(q1(qs, "musicFolderId")):
-            for i, info in enumerate(book.get("files") or []):
-                songs.append(song_obj(book, i, info))
+        songs = listed_songs(q1(qs, "musicFolderId"))
         random.shuffle(songs)
         try:
             size = int(q1(qs, "size", "10") or 10)
@@ -1476,7 +2525,8 @@ def handle_subsonic(handler, parsed):
         return
     if method in ("search2", "search3"):
         query = q1(qs, "query").strip().strip('"').lower()
-        books = folder_books(q1(qs, "musicFolderId"))
+        folder_id = q1(qs, "musicFolderId")
+        books = selected_books(folder_id)
         artists = []
         albums = []
         songs = []
@@ -1484,8 +2534,9 @@ def handle_subsonic(handler, parsed):
         if query:
             for book in books:
                 author = book_author(book)
-                if query in author.lower() and author not in seen:
-                    seen.add(author)
+                mark = "ar:" + author
+                if query in author.lower() and mark not in seen:
+                    seen.add(mark)
                     count = sum(1 for b in books if book_author(b) == author)
                     artists.append({"id": artist_key(author), "name": author, "albumCount": count})
                 if query in (book.get("name") or "").lower() or query in author.lower():
@@ -1493,6 +2544,24 @@ def handle_subsonic(handler, parsed):
                 for i, info in enumerate(book.get("files") or []):
                     if query in (info.get("name") or "").lower() or query in (book.get("name") or "").lower():
                         songs.append(song_obj(book, i, info))
+            for album in music_albums(folder_id):
+                artist = album.get("artist") or "Unknown"
+                mark = "mar:" + artist
+                if query in artist.lower() and mark not in seen:
+                    seen.add(mark)
+                    count = sum(1 for a in music_albums(folder_id) if (a.get("artist") or "Unknown") == artist)
+                    artists.append({"id": music_artist_key(artist), "name": artist, "albumCount": count})
+                if query in (album.get("name") or "").lower() or query in artist.lower():
+                    albums.append(music_album_obj(album))
+                for info in album.get("files") or []:
+                    hay = " ".join([
+                        info.get("title") or "",
+                        info.get("name") or "",
+                        info.get("album") or "",
+                        info.get("artist") or "",
+                    ]).lower()
+                    if query in hay:
+                        songs.append(music_song_obj(album, info))
         def take(key, items):
             try:
                 limit = int(q1(qs, key, "20") or 20)
@@ -1572,9 +2641,9 @@ def handle_subsonic(handler, parsed):
         q = playqueues.get(username) or {}
         entries = []
         for sid in q.get("ids") or []:
-            book, index = find_book(sid)
-            if book and index is not None and index < len(book.get("files") or []):
-                entries.append(song_obj(book, index, book["files"][index]))
+            song = resolve_song(sid)
+            if song:
+                entries.append(song)
         if not entries:
             ok({"playQueue": {"username": username, "position": 0, "changed": iso_now(), "entry": []}})
             return
@@ -1588,6 +2657,24 @@ def handle_subsonic(handler, parsed):
         return
     if method in ("stream", "download"):
         sid = q1(qs, "id")
+        if sid.startswith("ms:"):
+            album, info = music_song_by_id(sid)
+            if not album or not info:
+                handler.send_error(404)
+                return
+            path = resolve_music(info.get("rel") or "")
+            if path is None or not path.is_file():
+                handler.send_error(404)
+                return
+            handler.stream_file(path, as_download=method == "download")
+            return
+        if sid.startswith("mal:"):
+            album = music_album_by_id(sid)
+            if not album:
+                handler.send_error(404)
+                return
+            send_music_album_zip(handler, album)
+            return
         book, index = find_book(sid)
         if not book:
             handler.send_error(404)
@@ -1598,23 +2685,7 @@ def handle_subsonic(handler, parsed):
         send_song_file(handler, book, index, method == "download")
         return
     if method == "getCoverArt":
-        book, _idx = find_book(q1(qs, "id"))
-        if not book:
-            handler.send_error(404)
-            return
-        path = cover_file(book)
-        if not path:
-            handler.send_error(404)
-            return
-        mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        data = path.read_bytes()
-        handler.send_response(200)
-        handler.send_header("Content-Type", mime)
-        handler.send_header("Content-Length", str(len(data)))
-        handler.send_header("Cache-Control", "public, max-age=86400")
-        handler.end_headers()
-        if handler.command != "HEAD":
-            handler.wfile.write(data)
+        send_cover_art(handler, q1(qs, "id"))
         return
     if method == "getUser":
         asked = q1(qs, "username") or username
@@ -1622,6 +2693,8 @@ def handle_subsonic(handler, parsed):
             subsonic_error(handler, 50, "Not authorized", out_fmt)
             return
         folders = list(range(len(library_roots())))
+        if music_dir_ready():
+            folders.append(MUSIC_FOLDER_ID)
         ok({"user": {
             "username": asked,
             "email": "",
@@ -1642,126 +2715,118 @@ def handle_subsonic(handler, parsed):
         return
     if method == "getPlaylists":
         asked = q1(qs, "username")
-        if asked and asked != username and username != "admin":
-            subsonic_error(handler, 50, "Not authorized", out_fmt)
-            return
-        visible = []
-        for pl in playlists.values():
-            if asked and pl.get("owner") != asked:
-                continue
-            if playlist_visible(pl, username):
-                visible.append(playlist_obj(pl, username))
-        visible.sort(key=lambda item: (item.get("name") or "").lower())
-        ok({"playlists": {"playlist": visible}})
-        return
-    if method == "getPlaylist":
-        pid = q1(qs, "id")
-        pl = playlists.get(pid)
-        if not pl or not playlist_visible(pl, username):
-            subsonic_error(handler, 70, "Playlist not found", out_fmt)
-            return
-        ok({"playlist": playlist_obj(pl, username, with_entries=True)})
-        return
-    if method == "createPlaylist":
-        song_ids = qs.get("songId") or []
-        if isinstance(song_ids, str):
-            song_ids = [song_ids]
-        existing_id = q1(qs, "playlistId")
-        now = iso_now()
-        if existing_id:
-            pl = playlists.get(existing_id)
-            if not pl:
-                subsonic_error(handler, 70, "Playlist not found", out_fmt)
-                return
-            if pl.get("owner") != username and username != "admin":
+        if asked:
+            if asked != username and username != "admin":
                 subsonic_error(handler, 50, "Not authorized", out_fmt)
                 return
-            if q1(qs, "name"):
-                pl["name"] = q1(qs, "name")
-            if "songId" in qs:
-                pl["songIds"] = list(song_ids)
-            pl["changed"] = now
-            save_playlists()
-            ok({"playlist": playlist_obj(pl, username, with_entries=True)})
+            items = [playlist_obj(pl) for pl in playlists.values() if pl.get("owner") == asked]
+        else:
+            items = [playlist_obj(pl) for pl in playlists.values() if playlist_visible(pl, username)]
+        items.sort(key=lambda p: (p.get("name") or "").lower())
+        ok({"playlists": {"playlist": items}})
+        return
+    if method == "getPlaylist":
+        pid = q1(qs, "id") or q1(qs, "playlistId")
+        if not pid:
+            subsonic_error(handler, 10, "Required parameter missing", out_fmt)
             return
-        name = q1(qs, "name") or "Playlist"
-        pid = "pl_" + secrets.token_hex(8)
-        pl = {
-            "id": pid,
-            "name": name,
-            "owner": username,
-            "public": False,
-            "comment": q1(qs, "comment") or "",
-            "created": now,
-            "changed": now,
-            "songIds": list(song_ids),
-        }
-        playlists[pid] = pl
-        save_playlists()
-        ok({"playlist": playlist_obj(pl, username, with_entries=True)})
+        pl = playlist_get(pid)
+        if not pl:
+            subsonic_error(handler, 70, "Not found", out_fmt)
+            return
+        if not playlist_visible(pl, username):
+            subsonic_error(handler, 50, "Not authorized", out_fmt)
+            return
+        ok({"playlist": playlist_obj(pl, with_entries=True)})
+        return
+    if method == "createPlaylist":
+        pid = q1(qs, "playlistId")
+        name = q1(qs, "name")
+        song_ids = list(qs.get("songId") or [])
+        if pid:
+            pl = playlist_get(pid)
+            if not pl:
+                subsonic_error(handler, 70, "Not found", out_fmt)
+                return
+            if not playlist_owned(pl, username):
+                subsonic_error(handler, 50, "Not authorized", out_fmt)
+                return
+            if name:
+                pl["name"] = name
+            pl["songIds"] = song_ids
+            pl["changed"] = iso_now()
+            save_playlists()
+            ok({"playlist": playlist_obj(pl, with_entries=True)})
+            return
+        if not name:
+            subsonic_error(handler, 10, "Required parameter missing", out_fmt)
+            return
+        pl = new_playlist(username, name, song_ids)
+        ok({"playlist": playlist_obj(pl, with_entries=True)})
         return
     if method == "updatePlaylist":
         pid = q1(qs, "playlistId") or q1(qs, "id")
-        pl = playlists.get(pid)
-        if not pl:
-            subsonic_error(handler, 70, "Playlist not found", out_fmt)
+        if not pid:
+            subsonic_error(handler, 10, "Required parameter missing", out_fmt)
             return
-        if pl.get("owner") != username and username != "admin":
+        pl = playlist_get(pid)
+        if not pl:
+            subsonic_error(handler, 70, "Not found", out_fmt)
+            return
+        if not playlist_owned(pl, username):
             subsonic_error(handler, 50, "Not authorized", out_fmt)
             return
-        if q1(qs, "name"):
-            pl["name"] = q1(qs, "name")
+        name = q1(qs, "name")
+        if name:
+            pl["name"] = name
         if "comment" in qs:
-            pl["comment"] = q1(qs, "comment") or ""
-        if "public" in qs:
-            pl["public"] = q1(qs, "public", "").lower() in ("true", "1", "yes")
-        to_add = qs.get("songIdToAdd") or []
-        if isinstance(to_add, str):
-            to_add = [to_add]
-        if to_add:
-            pl.setdefault("songIds", []).extend(to_add)
-        to_remove = qs.get("songIndexToRemove") or []
-        if isinstance(to_remove, str):
-            to_remove = [to_remove]
-        if to_remove:
-            # Indexes match the entries returned by getPlaylist (resolved songs only).
-            resolved_at = []
-            for n, sid in enumerate(pl.get("songIds") or []):
-                book, index = find_book(sid)
-                files = (book or {}).get("files") or []
-                if book and index is not None and 0 <= index < len(files):
-                    resolved_at.append(n)
-            drop = set()
-            for raw in to_remove:
-                if not str(raw).isdigit():
-                    continue
-                i = int(raw)
-                if 0 <= i < len(resolved_at):
-                    drop.add(resolved_at[i])
-            pl["songIds"] = [sid for n, sid in enumerate(pl.get("songIds") or []) if n not in drop]
+            pl["comment"] = q1(qs, "comment")
+        public = q_bool(qs, "public")
+        if public is not None:
+            pl["public"] = public
+        song_ids = list(pl.get("songIds") or [])
+        remove_idx = []
+        for raw in qs.get("songIndexToRemove") or []:
+            try:
+                remove_idx.append(int(raw))
+            except ValueError:
+                continue
+        for idx in sorted(set(remove_idx), reverse=True):
+            if 0 <= idx < len(song_ids):
+                song_ids.pop(idx)
+        for sid in qs.get("songIdToAdd") or []:
+            if sid:
+                song_ids.append(sid)
+        pl["songIds"] = song_ids
         pl["changed"] = iso_now()
         save_playlists()
         ok()
         return
     if method == "deletePlaylist":
-        pid = q1(qs, "id")
-        pl = playlists.get(pid)
-        if not pl:
-            subsonic_error(handler, 70, "Playlist not found", out_fmt)
+        pid = q1(qs, "id") or q1(qs, "playlistId")
+        if not pid:
+            subsonic_error(handler, 10, "Required parameter missing", out_fmt)
             return
-        if pl.get("owner") != username and username != "admin":
+        pl = playlist_get(pid)
+        if not pl:
+            subsonic_error(handler, 70, "Not found", out_fmt)
+            return
+        if not playlist_owned(pl, username):
             subsonic_error(handler, 50, "Not authorized", out_fmt)
             return
-        playlists.pop(pid, None)
+        playlists.pop(str(pl["id"]), None)
         save_playlists()
         ok()
         return
     if method == "getScanStatus":
-        ok({"scanStatus": {"scanning": False, "count": len(get_books_cached() or [])}})
+        count = len(get_books_cached() or []) + len(get_music_cached() or [])
+        ok({"scanStatus": {"scanning": False, "count": count}})
         return
     if method == "startScan":
         get_books_cached(force=True)
-        ok({"scanStatus": {"scanning": False, "count": len(get_books_cached() or [])}})
+        get_music_cached(force=True)
+        count = len(get_books_cached() or []) + len(get_music_cached() or [])
+        ok({"scanStatus": {"scanning": False, "count": count}})
         return
     if method in ("getGenres", "getSongsByGenre", "getNowPlaying", "getVideos", "getPodcasts", "getNewestPodcasts", "getInternetRadioStations", "getShares", "getChatMessages", "getAvatar", "getLyrics", "getLyricsBySongId"):
         ok()
@@ -1903,7 +2968,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/books":
-                books = [b for b in (get_books_cached() or []) if b.get("kind") != "music"]
+                books = get_books_cached()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1914,7 +2979,7 @@ class Handler(BaseHTTPRequestHandler):
                 book_id = path[10:]
                 print(f"Book lookup: {book_id}")
                 book = get_book_by_id(book_id)
-                if not book or book.get("kind") == "music":
+                if not book:
                     print(f"Book not found: {book_id}")
                     self.send_error(404)
                     return
@@ -3781,11 +4846,11 @@ loadUsers();
 if __name__ == "__main__":
     print(f"Audiobook server on port {PORT}")
     print(f"Library: {AUDIO_DIR}")
-    print(f"Music: {MUSIC_DIR}")
+    print(f"Music library: {MUSIC_DIR}")
     print(f"Cover cache: {COVER_CACHE}")
     print(f"Users file: {USERS_FILE}")
     print(f"Library exists: {AUDIO_DIR.exists()}")
-    print(f"Music exists: {MUSIC_DIR.exists()}")
+    print(f"Music library exists: {MUSIC_DIR.is_dir()}")
 
     use_https = os.environ.get("HTTPS", "").lower() in ("1", "true", "yes")
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -3822,4 +4887,3 @@ if __name__ == "__main__":
         print("Then open https://audiobooks.YOUR_SLOT.box.ca/")
 
     httpd.serve_forever()
-

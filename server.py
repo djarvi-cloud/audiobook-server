@@ -265,6 +265,139 @@ def parse_name(name: str):
         return parts[0].strip(), parts[1].strip()
     return None, name
 
+def is_sidecar_meta(name: str) -> bool:
+    lower = name.lower()
+    return lower == "metadata.json" or lower.endswith(".metadata.json")
+
+def strip_catalog_id(name: str) -> str:
+    if not name:
+        return name
+    return re.sub(r"\s*\[[A-Za-z0-9]{8,}\]\s*$", "", str(name)).strip()
+
+def people_names(value):
+    names = []
+    if isinstance(value, str) and value.strip():
+        names.append(value.strip())
+    elif isinstance(value, dict) and value.get("name"):
+        names.append(str(value["name"]).strip())
+    elif isinstance(value, list):
+        for item in value:
+            names.extend(people_names(item))
+    return [name for name in names if name]
+
+def read_sidecar(data):
+    if not isinstance(data, dict):
+        return None, None
+    title = (data.get("title") or "").strip()
+    subtitle = (data.get("subtitle") or "").strip()
+    if title and subtitle and subtitle.lower() not in title.lower():
+        title = f"{title}: {subtitle}"
+    authors = data.get("authors") if data.get("authors") is not None else data.get("author")
+    return title or None, ", ".join(people_names(authors)) or None
+
+def apply_sidecar(title, author, data):
+    meta_title, meta_author = read_sidecar(data)
+    if meta_title:
+        title = meta_title
+    if meta_author:
+        author = meta_author
+    return strip_catalog_id(title), strip_catalog_id(author) if author else author
+
+def sidecar_genres(data):
+    if not isinstance(data, dict):
+        return "", []
+    genres = []
+
+    def take(ladder, genre_root_only):
+        if not isinstance(ladder, dict):
+            return
+        root = str(ladder.get("root") or "")
+        if genre_root_only and root and root.lower() not in ("genres", "genre"):
+            return
+        steps = ladder.get("ladder") or []
+        if not steps or not isinstance(steps[0], dict):
+            return
+        name = str(steps[0].get("name") or "").strip()
+        if name and name not in genres:
+            genres.append(name)
+
+    ladders = data.get("category_ladders") or []
+    for ladder in ladders:
+        take(ladder, True)
+    if not genres:
+        for ladder in ladders:
+            take(ladder, False)
+    return (genres[0] if genres else ""), genres
+
+def sidecar_details(data):
+    if not isinstance(data, dict):
+        return "", [], "", "", []
+    narrator = ", ".join(people_names(data.get("narrators") or data.get("narrator")))
+    info = data.get("ChapterInfo") or {}
+    raw = info.get("chapters") if isinstance(info, dict) else []
+    chapters = []
+    if isinstance(raw, list):
+        for chapter in raw:
+            if not isinstance(chapter, dict):
+                continue
+            title = (chapter.get("title") or "").strip()
+            if chapter.get("start_offset_sec") is not None:
+                start = int(float(chapter["start_offset_sec"]))
+            elif chapter.get("start_offset_ms") is not None:
+                start = int(float(chapter["start_offset_ms"]) / 1000)
+            else:
+                continue
+            if title:
+                chapters.append({"title": title, "start": max(0, start)})
+    images = data.get("product_images") or {}
+    cover_url = ""
+    if isinstance(images, dict) and images:
+        def rank(key):
+            try:
+                return int(str(key))
+            except ValueError:
+                return 0
+        best = images.get(max(images, key=rank))
+        if isinstance(best, str) and best.startswith("http"):
+            cover_url = best
+    genre, genres = sidecar_genres(data)
+    return narrator, chapters, cover_url, genre, genres
+
+def read_local_meta(rel):
+    if not rel:
+        return {}
+    try:
+        meta_file, _, _ = resolve_lib(rel)
+        data = json.loads(meta_file.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"Local metadata read failed: {e}")
+        return {}
+
+def describe_book(author, title, local_meta, file_count):
+    data = read_local_meta(local_meta)
+    title, author = apply_sidecar(title, author, data)
+    narrator, chapters, cover_url, genre, genres = sidecar_details(data)
+    if file_count != 1:
+        chapters = []
+    return title, author or "", narrator, chapters, cover_url, genre, genres
+
+def save_remote_cover(url, book_id):
+    if not url:
+        return None
+    dest = COVER_CACHE / f"{book_id}.jpg"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "audiobook-server"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read(8000000)
+        if len(data) < 1000:
+            return None
+        dest.write_bytes(data)
+        return dest
+    except Exception as e:
+        print(f"Cover download failed: {e}")
+        return None
+
 def fetch_from_isbn(isbn: str):
     """Look up a book by ISBN on Open Library, then Google Books."""
     isbn = isbn.replace("-", "").replace(" ", "").strip()
@@ -568,7 +701,7 @@ def scan_folder(rel: str = "", scope: str = "books"):
                     local_cover = entry_rel
                 elif local_cover is None:
                     local_cover = entry_rel
-            elif entry.name.lower() == "metadata.json":
+            elif is_sidecar_meta(entry.name):
                 local_meta = entry_rel
     except Exception as e:
         print(f"Scan error: {e}")
@@ -577,17 +710,9 @@ def scan_folder(rel: str = "", scope: str = "books"):
         files_in_this_dir.sort(key=lambda f: f["name"])
         folder_name = Path(inner).name if inner else (root.name or "Library")
         author, title = parse_name(folder_name)
-
-        if local_meta:
-            try:
-                meta_file, _, _ = resolve_lib(local_meta)
-                local_data = json.loads(meta_file.read_text())
-                if local_data.get("title"):
-                    title = local_data["title"]
-                if local_data.get("author") or local_data.get("authors"):
-                    author = local_data.get("author") or (local_data.get("authors") or [None])[0]
-            except Exception as e:
-                print(f"Local metadata read failed: {e}")
+        title, author, narrator, chapters, cover_url, genre, genres = describe_book(
+            author, title, local_meta, len(files_in_this_dir)
+        )
 
         book_key = join_lib_path(index, inner) or files_in_this_dir[0]["rel"]
         book_id = get_book_id(book_key)
@@ -596,6 +721,11 @@ def scan_folder(rel: str = "", scope: str = "books"):
             "id": book_id,
             "name": custom.get("title") or title or folder_name,
             "author": custom.get("author") or author or "",
+            "narrator": narrator,
+            "genre": genre,
+            "genres": genres,
+            "chapters": chapters,
+            "coverUrl": cover_url,
             "files": files_in_this_dir,
             "cover": local_cover,
             "path": join_lib_path(index, inner),
@@ -632,7 +762,7 @@ def scan_books_full():
                         cover = rel
                     elif cover is None:
                         cover = rel
-                elif entry.name.lower() == "metadata.json":
+                elif is_sidecar_meta(entry.name):
                     local_meta = rel
             if files:
                 files.sort(key=lambda f: f["name"])
@@ -642,16 +772,9 @@ def scan_books_full():
                     parent = Path(inner).parent.name
                     if parent and not author:
                         author = parent
-                if local_meta:
-                    try:
-                        meta_file, _, _ = resolve_lib(local_meta)
-                        local_data = json.loads(meta_file.read_text())
-                        if local_data.get("title"):
-                            title = local_data["title"]
-                        if local_data.get("author") or local_data.get("authors"):
-                            author = local_data.get("author") or (local_data.get("authors") or [None])[0]
-                    except Exception as e:
-                        print(f"Local metadata read failed: {e}")
+                title, author, narrator, chapters, cover_url, genre, genres = describe_book(
+                    author, title, local_meta, len(files)
+                )
                 book_key = (inner if index == 0 else join_lib_path(index, inner)) or files[0]["rel"]
                 book_id = get_book_id(book_key)
                 custom = metadata.get(book_id, {})
@@ -659,6 +782,11 @@ def scan_books_full():
                     "id": book_id,
                     "name": custom.get("title") or title or folder_name,
                     "author": custom.get("author") or author or "",
+                    "narrator": narrator,
+                    "genre": genre,
+                    "genres": genres,
+                    "chapters": chapters,
+                    "coverUrl": cover_url,
                     "files": files,
                     "cover": cover,
                     "path": join_lib_path(index, inner),
@@ -713,7 +841,7 @@ def get_book_by_id(book_id: str):
             elif entry.suffix.lower() in IMAGE_EXTS:
                 if cover is None or entry.name.lower() in COVER_NAMES:
                     cover = entry_rel
-            elif entry.name.lower() == "metadata.json":
+            elif is_sidecar_meta(entry.name):
                 local_meta = entry_rel
     except Exception:
         pass
@@ -724,22 +852,20 @@ def get_book_by_id(book_id: str):
     files.sort(key=lambda f: f["name"])
     folder_name = Path(inner).name if inner else (root.name if root else "Library")
     author, title = parse_name(folder_name)
-    if local_meta:
-        try:
-            meta_file, _, _ = resolve_lib(local_meta)
-            local_data = json.loads(meta_file.read_text())
-            if local_data.get("title"):
-                title = local_data["title"]
-            if local_data.get("author") or local_data.get("authors"):
-                author = local_data.get("author") or (local_data.get("authors") or [None])[0]
-        except Exception:
-            pass
+    title, author, narrator, chapters, cover_url, genre, genres = describe_book(
+        author, title, local_meta, len(files)
+    )
 
     custom = metadata.get(book_id, {})
     return {
         "id": book_id,
         "name": custom.get("title") or title or folder_name,
         "author": custom.get("author") or author or "",
+        "narrator": narrator,
+        "genre": genre,
+        "genres": genres,
+        "chapters": chapters,
+        "coverUrl": cover_url,
         "files": files,
         "cover": cover,
         "path": join_lib_path(index, inner),
@@ -1189,6 +1315,10 @@ def cover_file(book):
             return path
     if cached.exists():
         return cached
+    if book.get("coverUrl"):
+        saved = save_remote_cover(book["coverUrl"], book_id)
+        if saved:
+            return saved
     return None
 
 def artists_from(books):
@@ -2806,18 +2936,21 @@ def handle_subsonic(handler, parsed):
         return
     if method == "scrobble":
         ids = qs.get("id") or []
-        times = qs.get("time") or []
+        positions = qs.get("position") or []
         for i, sid in enumerate(ids):
             book, index = find_book(sid)
-            if not book or index is None:
+            if not book:
                 continue
-            if i < len(times) and times[i] != "":
-                try:
-                    seconds = float(times[i])
-                except ValueError:
-                    seconds = 0
-            else:
-                seconds = (progress.get(username) or {}).get(book["id"], {}).get("time", 0)
+            if index is None:
+                index = 0
+            if i >= len(positions) or positions[i] == "":
+                continue
+            try:
+                seconds = float(positions[i]) / 1000.0
+            except ValueError:
+                continue
+            if seconds < 0 or seconds > 200000:
+                continue
             set_listen_progress(username, book, index, seconds)
         ok()
         return
@@ -3378,6 +3511,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Serve already-cached auto cover if present
                 cached = COVER_CACHE / f"{book_id}.jpg"
+                if not cached.exists() and book.get("coverUrl"):
+                    save_remote_cover(book["coverUrl"], book_id)
                 if cached.exists():
                     self.send_response(200)
                     self.send_header("Content-Type", "image/jpeg")
@@ -4125,6 +4260,9 @@ HTML = '''<!DOCTYPE html>
     <header style="padding:0.9rem 1.5rem; background:var(--card); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:1rem;">
       <input id="global-search" placeholder="Search books..." style="flex:1; max-width:320px; padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);" oninput="globalSearch()">
       <button id="view-toggle" onclick="toggleView()" style="white-space:nowrap;">All Books</button>
+      <select id="genre-filter" onchange="showAllBooks()" style="padding:0.45rem 0.5rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); max-width:46vw;">
+        <option value="">All genres</option>
+      </select>
     </header>
     <div id="continue" style="padding:1.25rem 1.5rem 0; display:none;">
       <h3 style="margin:0 0 0.6rem; font-size:0.9rem; color:var(--muted);">Continue Listening</h3>
@@ -4189,6 +4327,7 @@ function bookCard(b, extra) {
       <div class="item-info">
         <div class="item-name">${b.name || 'Untitled'}</div>
         ${b.author ? `<div class="author">${b.author}</div>` : ''}
+        ${b.genre ? `<div class="author">${b.genre}</div>` : ''}
         ${extra || ''}
       </div>
     </div>`;
@@ -4207,11 +4346,63 @@ function toggleView() {
 async function showAllBooks() {
   const books = (await loadAllBooks()).filter(b => !finishedIds.has(b.id));
   const music = library === 'music';
+  const filter = document.getElementById('genre-filter');
+  if (filter) filter.style.display = music ? 'none' : '';
   document.getElementById('breadcrumb').innerHTML = music ? 'All Albums' : 'All Books';
   document.getElementById('continue').style.display = '';
   showContinue();
   const empty = music ? '<p>No music found.</p>' : '<p>No books found.</p>';
-  document.getElementById('list').innerHTML = books.length ? books.map(b => bookCard(b)).join('') : empty;
+  document.getElementById('list').innerHTML = music
+    ? (books.length ? books.map(b => bookCard(b)).join('') : empty)
+    : renderGenreBooks(books);
+}
+
+function fillGenreFilter(books) {
+  const sel = document.getElementById('genre-filter');
+  if (!sel) return;
+  const current = sel.value;
+  const names = [];
+  books.forEach(b => {
+    const list = (b.genres && b.genres.length) ? b.genres : (b.genre ? [b.genre] : []);
+    list.forEach(name => { if (name && names.indexOf(name) < 0) names.push(name); });
+  });
+  names.sort((a, b) => a.localeCompare(b));
+  sel.innerHTML = '<option value="">All genres</option>' + names.map(name => {
+    const safe = String(name).replace(/&/g, '&').replace(/</g, '<').replace(/"/g, '"');
+    return '<option value="' + safe + '">' + safe + '</option>';
+  }).join('');
+  if ([...sel.options].some(o => o.value === current)) sel.value = current;
+}
+
+function booksByGenre(books) {
+  const sel = document.getElementById('genre-filter');
+  const genre = sel ? sel.value : '';
+  let list = books.slice();
+  if (genre) list = list.filter(b => ((b.genres && b.genres.length) ? b.genres : (b.genre ? [b.genre] : [])).indexOf(genre) >= 0);
+  list.sort((a, b) => {
+    const ga = (a.genre || 'Other').toLowerCase();
+    const gb = (b.genre || 'Other').toLowerCase();
+    if (ga !== gb) return ga < gb ? -1 : 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  return { list, genre };
+}
+
+function renderGenreBooks(books) {
+  fillGenreFilter(books);
+  const picked = booksByGenre(books);
+  if (!picked.list.length) return '<p>No books found.</p>';
+  let html = '';
+  let last = '';
+  picked.list.forEach(b => {
+    const name = b.genre || 'Other';
+    if (!picked.genre && name !== last) {
+      html += '<h3 style="grid-column:1/-1; margin:0.8rem 0 0; font-size:0.95rem; color:var(--muted);">' + String(name).replace(/&/g, '&').replace(/</g, '<') + '</h3>';
+      last = name;
+    }
+    html += bookCard(b);
+  });
+  return html;
 }
 
 async function loadAllBooks() {
@@ -4352,10 +4543,13 @@ async function showContinue() {
     document.getElementById('continue-list').innerHTML = recent.map(x => {
       const folder = x.book.path ? x.book.path.split('/').slice(-2, -1)[0] || x.book.path : '';
       return `
-      <div class="item" style="min-width:200px; flex-shrink:0; padding:0.6rem; position:relative;" onclick="location.href='/book/${x.id}'">
-        <div class="item-name">${x.book.name || 'Untitled'}</div>
-        ${folder ? `<div class="author" style="font-size:0.75rem; opacity:0.7;">${folder}</div>` : ''}
-        <button onclick="event.stopPropagation(); removeContinue('${x.id}')" style="position:absolute; top:4px; right:4px; padding:0.15rem 0.4rem; font-size:0.75rem; background:transparent; border:none; color:var(--muted);">×</button>
+      <div class="item" style="min-width:140px; width:140px; flex-shrink:0; position:relative;" onclick="location.href='/book/${x.id}'">
+        <img class="cover" src="/cover/${x.id}" alt="" loading="lazy" onerror="this.style.background='#333'; this.src=''">
+        <div class="item-info">
+          <div class="item-name">${x.book.name || 'Untitled'}</div>
+          ${folder ? `<div class="author">${folder}</div>` : ''}
+        </div>
+        <button onclick="event.stopPropagation(); removeContinue('${x.id}')" style="position:absolute; top:4px; right:4px; padding:0.15rem 0.4rem; font-size:0.75rem; background:rgba(0,0,0,.55); color:#fff; border:none; border-radius:6px;">×</button>
       </div>`;
     }).join('');
   } catch (e) {}
@@ -4373,7 +4567,11 @@ async function globalSearch() {
   const matches = books.filter(b =>
     !finishedIds.has(b.id) && (
       (b.name || '').toLowerCase().includes(q) ||
-      (b.author || '').toLowerCase().includes(q)
+      (b.author || '').toLowerCase().includes(q) ||
+      (b.narrator || '').toLowerCase().includes(q) ||
+      (b.genre || '').toLowerCase().includes(q) ||
+      ((b.genres || []).join(' ').toLowerCase().includes(q)) ||
+      (b.path || '').toLowerCase().includes(q)
     )
   );
   const empty = library === 'music' ? '<p>No music matches</p>' : '<p>No matches</p>';
@@ -4872,7 +5070,8 @@ async function load() {
     }
     book = await bookRes.json();
     document.getElementById('title').textContent = book.name || 'Untitled';
-    document.getElementById('author').textContent = book.author || '';
+    const who = book.author || '';
+    document.getElementById('author').textContent = book.narrator ? (who + (who ? ' · ' : '') + 'Narrated by ' + book.narrator) : who;
     if (book.kind === 'music') {
       const back = document.querySelector('header a');
       back.href = '/?library=music';
@@ -4997,10 +5196,35 @@ function skip(sec) {
   audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + sec));
 }
 
+let pendingSeek = null;
+function seekChapter(start) {
+  pendingSeek = start;
+  fileIndex = 0;
+  if (!audio.src) loadFile(true);
+  else {
+    try { audio.currentTime = start; } catch (e) {}
+    pendingSeek = null;
+    const play = audio.play();
+    if (play) play.catch(() => {});
+    saveNow();
+  }
+  updateActive();
+}
 function renderTracks() {
   const ul = document.getElementById('tracks');
+  const chapters = (book.kind === 'music') ? [] : (book.chapters || []);
+  if (chapters.length) {
+    ul.innerHTML = chapters.map(ch => {
+      const label = String(ch.title || '').replace(/&/g, '&').replace(/</g, '<');
+      const mins = Math.floor(ch.start / 60);
+      const secs = String(Math.floor(ch.start % 60)).padStart(2, '0');
+      return '<li data-start="' + ch.start + '" onclick="seekChapter(' + ch.start + ')" style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;"><span style="flex:1;">' + label + '</span><span style="color:var(--muted); font-size:0.8rem;">' + mins + ':' + secs + '</span></li>';
+    }).join('');
+    updateActive();
+    return;
+  }
   ul.innerHTML = book.files.map((f, i) => {
-    const safeName = (f.name || '').replace(/&/g, '&').replace(/</g, '<').replace(/"/g, '"');
+    const safeName = (f.name || '').replace(/&/g, '&').replace(/</g, '<');
     return `<li data-idx="${i}" style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
       <span style="flex:1;">${safeName}</span>
       <button type="button" onclick="playIndex(${i})">Play</button>
@@ -5010,6 +5234,16 @@ function renderTracks() {
 }
 
 function updateActive() {
+  const chapters = (book && book.kind !== 'music' && book.chapters) || [];
+  if (chapters.length) {
+    const now = audio.currentTime || 0;
+    let active = 0;
+    chapters.forEach((ch, i) => { if (now + 0.5 >= ch.start) active = i; });
+    document.querySelectorAll('#tracks li').forEach((li, i) => li.classList.toggle('active', i === active));
+    document.getElementById('track-label').textContent = chapters[active] ? chapters[active].title : '';
+    document.getElementById('download-link').href = '/stream/' + BOOK_ID + '/0?download=1';
+    return;
+  }
   document.querySelectorAll('#tracks li').forEach((li, i) => {
     li.classList.toggle('active', i === fileIndex);
   });
@@ -5035,9 +5269,12 @@ function loadFile(andPlay) {
     document.getElementById('progress-info').textContent = 'Stream error: ' + (err ? err.code : 'unknown');
   };
   audio.onloadedmetadata = () => {
-    if (time > 1 && Math.abs(audio.currentTime - time) > 2) {
-      try { audio.currentTime = time; } catch (e) {}
+    const jump = pendingSeek != null ? pendingSeek : time;
+    pendingSeek = null;
+    if (jump > 1 && Math.abs(audio.currentTime - jump) > 2) {
+      try { audio.currentTime = jump; } catch (e) {}
     }
+    updateActive();
   };
   if (andPlay) {
     const p = audio.play();
@@ -5156,6 +5393,7 @@ audio.ontimeupdate = () => {
   }
   if (audio.duration && (audio.duration - audio.currentTime) < 20) preloadNext();
   if (audio.currentTime - lastSave > 10) { saveNow(); lastSave = audio.currentTime; }
+  if (book && book.chapters && book.chapters.length) updateActive();
   // Time info
   if (audio.duration) {
     const rem = audio.duration - audio.currentTime;

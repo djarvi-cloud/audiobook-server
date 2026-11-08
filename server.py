@@ -4230,19 +4230,53 @@ HTML = '''<!DOCTYPE html>
   }
   #continue { padding: 1.25rem 1.75rem 0; }
   #continue h3 { margin: 0 0 0.6rem; font-size: 0.95rem; font-weight: 600; color: var(--muted); }
-  #continue-list .item { min-width: 200px; }
+  #continue-list .item { min-width: 140px; }
   .error { color: #f66; padding: 1rem; }
+  #shell { display: flex; flex-direction: column; min-height: 100vh; }
+  #sidebar {
+    display: none;
+    position: absolute;
+    z-index: 40;
+    top: 3.4rem;
+    left: 0.75rem;
+    width: 240px;
+    max-width: calc(100vw - 1.5rem);
+    max-height: calc(100vh - 4.5rem);
+    overflow: auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.45);
+    padding: 0.9rem 0.85rem;
+  }
+  #sidebar.open { display: block; }
+  #main { width: 100%; max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; }
+  #topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    padding: 0.6rem 0.75rem;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+  }
+  #menu-btn { min-height: 40px; }
+  #topbar #global-search { flex: 1; width: auto; max-width: none; min-height: 40px; font-size: 16px; }
+  #list { padding: 0.75rem; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.7rem; }
+  #continue { padding: 0.75rem 0.75rem 0; }
 </style>
 </head>
 <body>
-<div style="display:flex; min-height:100vh;">
-  <aside style="width:220px; background:var(--card); border-right:1px solid var(--border); padding:1.25rem 1rem; flex-shrink:0;">
-    <h1 style="margin:0 0 1rem; font-size:1.15rem;">Library</h1>
+<div id="shell">
+  <aside id="sidebar">
+    <h1 style="margin:0 0 0.8rem; font-size:1.15rem;">Library</h1>
     <div class="tabs">
       <button id="tab-books" type="button" onclick="setLibrary('books')">Audiobooks</button>
       <button id="tab-music" type="button" onclick="setLibrary('music')">Music</button>
     </div>
-    <div id="breadcrumb" style="font-size:0.85rem; margin-bottom:1.5rem;"></div>
     <div style="display:flex; flex-direction:column; gap:0.4rem;">
       <button id="nav-collections" onclick="showCollections()" style="text-align:left;">Collections</button>
       <button id="nav-finished" onclick="showFinished()" style="text-align:left;">Finished</button>
@@ -4256,15 +4290,17 @@ HTML = '''<!DOCTYPE html>
       <a href="/logout"><button style="width:100%; text-align:left;">Logout</button></a>
     </div>
   </aside>
-  <div style="flex:1; display:flex; flex-direction:column;">
-    <header style="padding:0.9rem 1.5rem; background:var(--card); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:1rem;">
-      <input id="global-search" placeholder="Search books..." style="flex:1; max-width:320px; padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);" oninput="globalSearch()">
-      <button id="view-toggle" onclick="toggleView()" style="white-space:nowrap;">All Books</button>
+  <div id="main">
+    <header id="topbar">
+      <button id="menu-btn" type="button" onclick="toggleMenu(event)">Menu</button>
+      <input id="global-search" placeholder="Search books..." oninput="globalSearch()">
+      <button id="view-toggle" onclick="toggleView()" style="white-space:nowrap;">Folders</button>
       <select id="genre-filter" onchange="showAllBooks()" style="padding:0.45rem 0.5rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); max-width:46vw;">
         <option value="">All genres</option>
       </select>
     </header>
-    <div id="continue" style="padding:1.25rem 1.5rem 0; display:none;">
+    <div id="breadcrumb" style="font-size:0.85rem; padding:0.75rem 0.75rem 0;"></div>
+    <div id="continue" style="display:none;">
       <h3 style="margin:0 0 0.6rem; font-size:0.9rem; color:var(--muted);">Continue Listening</h3>
       <div id="continue-list" style="display:flex; gap:0.75rem; overflow-x:auto; padding-bottom:0.5rem;"></div>
     </div>
@@ -4280,7 +4316,24 @@ if (IS_ADMIN) {
 
 let currentPath = '';
 let allBooksCache = null;
-let viewMode = 'folders'; // 'folders' or 'books'
+let viewMode = 'books';
+
+function toggleMenu(e) {
+  if (e) e.stopPropagation();
+  var el = document.getElementById('sidebar');
+  if (el) el.classList.toggle('open');
+}
+document.addEventListener('click', function(e) {
+  var el = document.getElementById('sidebar');
+  var btn = document.getElementById('menu-btn');
+  if (!el || !el.classList.contains('open')) return;
+  if (btn && btn.contains(e.target)) return;
+  if (el.contains(e.target)) {
+    if (e.target.closest('button, a')) el.classList.remove('open');
+    return;
+  }
+  el.classList.remove('open');
+});
 let finishedIds = new Set();
 const requestedLibrary = new URLSearchParams(location.search).get('library');
 let library = requestedLibrary === 'music' || requestedLibrary === 'books'
@@ -4292,11 +4345,12 @@ function setLibrary(next) {
   localStorage.setItem('library', library);
   allBooksCache = null;
   currentPath = '';
-  viewMode = 'folders';
+  viewMode = next === 'music' ? 'folders' : 'books';
   const search = document.getElementById('global-search');
   if (search) search.value = '';
   updateLibraryChrome();
-  load('');
+  if (viewMode === 'books') showAllBooks();
+  else load('');
 }
 
 function updateLibraryChrome() {
@@ -4739,7 +4793,11 @@ function render(data) {
 }
 
 updateLibraryChrome();
-loadFinished().then(function() { load(''); showContinue(); });
+loadFinished().then(function() {
+  updateLibraryChrome();
+  if (library === 'books') showAllBooks();
+  else { load(''); showContinue(); }
+});
 </script>
 </body>
 </html>'''

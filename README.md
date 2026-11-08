@@ -20,7 +20,7 @@ Log in at https://audobooks.covertsa.com once after the first start so Subsonic 
 
 ## Music and playlists
 
-- Put music under `MUSIC_DIR` (artist/album folders or simple album folders). It appears as an additional music folder in Subsonic clients.
+- Put music under `MUSIC_DIR` (artist/album folders or simple album folders). The website has separate Audiobooks and Music tabs. Subsonic clients see music as its own folder.
 - Playlists are stored in `playlists.json` (not in git). Create, update, and delete them from any Subsonic client. A playlist is visible to its owner; others see it only if marked public.
 
 ## Update

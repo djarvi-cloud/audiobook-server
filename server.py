@@ -532,17 +532,29 @@ def library_list():
         })
     return items
 
-def scan_folder(rel: str = ""):
-    """Return folders and books at a given relative path."""
+def scan_folder(rel: str = "", scope: str = "books"):
+    """Return folders and books at a given relative path.
+
+    scope "books" never shows the music library. scope "music" only shows it.
+    """
     roots = library_roots()
-    book_indexes = [i for i, root in enumerate(roots) if not is_music_path(root)]
-    if not (rel or "").strip("/") and len(book_indexes) > 1:
-        folders = [{"name": (roots[i].name or str(roots[i])), "path": f"~{i}~"} for i in book_indexes]
-        return {"folders": folders, "books": [], "current": "", "rootName": "Libraries"}
+    scope = "music" if scope == "music" else "books"
+    if scope == "music":
+        music_index = next((i for i, root in enumerate(roots) if is_music_path(root)), None)
+        if music_index is None:
+            return {"folders": [], "books": [], "current": "", "rootName": "Music", "library": "music", "missing": True}
+        if not (rel or "").strip("/"):
+            rel = f"~{music_index}~"
+    else:
+        book_indexes = [i for i, root in enumerate(roots) if not is_music_path(root)]
+        if not (rel or "").strip("/") and len(book_indexes) > 1:
+            folders = [{"name": (roots[i].name or str(roots[i])), "path": f"~{i}~"} for i in book_indexes]
+            return {"folders": folders, "books": [], "current": "", "rootName": "Libraries", "library": "books"}
 
     target, root, index = resolve_lib(rel)
-    if target is None or not target.is_dir() or is_music_path(root):
-        return {"folders": [], "books": [], "current": rel, "rootName": ""}
+    music_here = bool(root is not None and is_music_path(root))
+    if target is None or not target.is_dir() or (scope == "books" and music_here) or (scope == "music" and not music_here):
+        return {"folders": [], "books": [], "current": rel, "rootName": "Music" if scope == "music" else "", "library": scope}
     _, inner = split_lib_path(rel)
 
     folders = []
@@ -599,10 +611,11 @@ def scan_folder(rel: str = ""):
             "author": custom.get("author") or author or "",
             "files": files_in_this_dir,
             "cover": local_cover,
-            "path": join_lib_path(index, inner)
+            "path": join_lib_path(index, inner),
+            "kind": "music" if is_music_path(root) else "audiobook",
         })
 
-    return {"folders": folders, "books": books, "current": rel, "rootName": root.name or ""}
+    return {"folders": folders, "books": books, "current": rel, "rootName": root.name or "", "library": scope}
 
 def scan_books_full():
     """Full scan used by book page and streaming."""
@@ -1858,10 +1871,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/browse":
                 qs = parse_qs(parsed.query)
                 rel = qs.get("path", [""])[0]
+                scope = qs.get("library", ["books"])[0]
+                if scope not in ("books", "music"):
+                    scope = "books"
                 # Basic path safety
                 if ".." in rel or rel.startswith("/"):
                     rel = ""
-                data = scan_folder(rel)
+                data = scan_folder(rel, scope)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1903,7 +1919,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/books":
-                books = [b for b in (get_books_cached() or []) if b.get("kind") != "music"]
+                qs = parse_qs(parsed.query)
+                scope = qs.get("library", ["books"])[0]
+                books = list(get_books_cached() or [])
+                if scope == "music":
+                    books = [b for b in books if b.get("kind") == "music"]
+                else:
+                    books = [b for b in books if b.get("kind") != "music"]
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1914,7 +1936,7 @@ class Handler(BaseHTTPRequestHandler):
                 book_id = path[10:]
                 print(f"Book lookup: {book_id}")
                 book = get_book_by_id(book_id)
-                if not book or book.get("kind") == "music":
+                if not book:
                     print(f"Book not found: {book_id}")
                     self.send_error(404)
                     return
@@ -2668,6 +2690,9 @@ HTML = '''<!DOCTYPE html>
   }
   .header-left { display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap; }
   h1 { margin: 0; font-size: 1.3rem; font-weight: 600; letter-spacing: -0.02em; }
+  .tabs { display: flex; gap: 0.35rem; margin: 0 0 1rem; }
+  .tabs button { flex: 1; font-weight: 600; }
+  .tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   #breadcrumb { font-size: 0.9rem; color: var(--muted); }
   #breadcrumb a { color: var(--accent); text-decoration: none; }
   #breadcrumb a:hover { text-decoration: underline; }
@@ -2744,11 +2769,15 @@ HTML = '''<!DOCTYPE html>
 <body>
 <div style="display:flex; min-height:100vh;">
   <aside style="width:220px; background:var(--card); border-right:1px solid var(--border); padding:1.25rem 1rem; flex-shrink:0;">
-    <h1 style="margin:0 0 1.5rem; font-size:1.15rem;">Audiobooks</h1>
+    <h1 style="margin:0 0 1rem; font-size:1.15rem;">Library</h1>
+    <div class="tabs">
+      <button id="tab-books" type="button" onclick="setLibrary('books')">Audiobooks</button>
+      <button id="tab-music" type="button" onclick="setLibrary('music')">Music</button>
+    </div>
     <div id="breadcrumb" style="font-size:0.85rem; margin-bottom:1.5rem;"></div>
     <div style="display:flex; flex-direction:column; gap:0.4rem;">
-      <button onclick="showCollections()" style="text-align:left;">Collections</button>
-      <button onclick="showFinished()" style="text-align:left;">Finished</button>
+      <button id="nav-collections" onclick="showCollections()" style="text-align:left;">Collections</button>
+      <button id="nav-finished" onclick="showFinished()" style="text-align:left;">Finished</button>
       <button onclick="rescan()" style="text-align:left;">Rescan</button>
       <button onclick="clearCovers()" style="text-align:left;">Clear Covers</button>
       <button onclick="toggleTheme()" style="text-align:left;">Theme</button>
@@ -2781,6 +2810,34 @@ let currentPath = '';
 let allBooksCache = null;
 let viewMode = 'folders'; // 'folders' or 'books'
 let finishedIds = new Set();
+const requestedLibrary = new URLSearchParams(location.search).get('library');
+let library = requestedLibrary === 'music' || requestedLibrary === 'books'
+  ? requestedLibrary
+  : (localStorage.getItem('library') === 'music' ? 'music' : 'books');
+
+function setLibrary(next) {
+  library = next === 'music' ? 'music' : 'books';
+  localStorage.setItem('library', library);
+  allBooksCache = null;
+  currentPath = '';
+  viewMode = 'folders';
+  const search = document.getElementById('global-search');
+  if (search) search.value = '';
+  updateLibraryChrome();
+  load('');
+}
+
+function updateLibraryChrome() {
+  const music = library === 'music';
+  document.getElementById('tab-books').classList.toggle('active', !music);
+  document.getElementById('tab-music').classList.toggle('active', music);
+  document.getElementById('nav-collections').style.display = music ? 'none' : '';
+  document.getElementById('nav-finished').style.display = music ? 'none' : '';
+  document.getElementById('global-search').placeholder = music ? 'Search music...' : 'Search books...';
+  const toggle = document.getElementById('view-toggle');
+  if (viewMode === 'folders') toggle.textContent = music ? 'All Albums' : 'All Books';
+  else toggle.textContent = 'Folders';
+}
 
 async function loadFinished() {
   try {
@@ -2805,25 +2862,27 @@ function bookCard(b, extra) {
 
 function toggleView() {
   viewMode = viewMode === 'folders' ? 'books' : 'folders';
-  document.getElementById('view-toggle').textContent = viewMode === 'folders' ? 'All Books' : 'Folders';
+  updateLibraryChrome();
   if (viewMode === 'books') {
     showAllBooks();
   } else {
-    load(currentPath);
+    load('');
   }
 }
 
 async function showAllBooks() {
   const books = (await loadAllBooks()).filter(b => !finishedIds.has(b.id));
-  document.getElementById('breadcrumb').innerHTML = 'All Books';
+  const music = library === 'music';
+  document.getElementById('breadcrumb').innerHTML = music ? 'All Albums' : 'All Books';
   document.getElementById('continue').style.display = '';
   showContinue();
-  document.getElementById('list').innerHTML = books.length ? books.map(b => bookCard(b)).join('') : '<p>No books found.</p>';
+  const empty = music ? '<p>No music found.</p>' : '<p>No books found.</p>';
+  document.getElementById('list').innerHTML = books.length ? books.map(b => bookCard(b)).join('') : empty;
 }
 
 async function loadAllBooks() {
   if (!allBooksCache) {
-    const r = await fetch('/api/books');
+    const r = await fetch('/api/books?library=' + encodeURIComponent(library));
     allBooksCache = await r.json();
   }
   return allBooksCache;
@@ -2928,7 +2987,8 @@ async function globalSearch() {
       (b.author || '').toLowerCase().includes(q)
     )
   );
-  document.getElementById('list').innerHTML = matches.length ? matches.map(b => bookCard(b)).join('') : '<p>No matches</p>';
+  const empty = library === 'music' ? '<p>No music matches</p>' : '<p>No matches</p>';
+  document.getElementById('list').innerHTML = matches.length ? matches.map(b => bookCard(b)).join('') : empty;
   document.getElementById('breadcrumb').innerHTML = 'Search results';
 }
 
@@ -2944,6 +3004,7 @@ async function rescan() {
   btn.textContent = 'Scanning...';
   try {
     await fetch('/api/rescan');
+    allBooksCache = null;
     load(currentPath);
   } catch (e) {
     alert('Rescan failed');
@@ -2972,7 +3033,7 @@ async function clearCovers() {
 async function load(path = '') {
   currentPath = path;
   try {
-    const r = await fetch('/api/browse?path=' + encodeURIComponent(path));
+    const r = await fetch('/api/browse?library=' + encodeURIComponent(library) + '&path=' + encodeURIComponent(path));
     if (!r.ok) throw new Error('Failed to load');
     const data = await r.json();
     render(data);
@@ -3044,9 +3105,18 @@ async function removeLibrary(i) {
 }
 
 function updateBreadcrumb(path, rootName) {
-  const parts = path ? path.split('/') : [];
-  let html = '<a href="#" onclick="load(\\'\\'); return false;">Library</a>';
+  const rootLabel = library === 'music' ? 'Music' : 'Audiobooks';
+  let shown = path || '';
   let accum = '';
+  if (library === 'music') {
+    const rootMatch = shown.match(/^(~\d+~)\/?/);
+    if (rootMatch) {
+      accum = rootMatch[1];
+      shown = shown.slice(rootMatch[0].length);
+    }
+  }
+  const parts = shown ? shown.split('/').filter(Boolean) : [];
+  let html = '<a href="#" onclick="load(\\'\\'); return false;">' + rootLabel + '</a>';
   parts.forEach(p => {
     accum = accum ? accum + '/' + p : p;
     const label = (/^~\\d+~$/.test(p) && rootName) ? rootName : p;
@@ -3058,6 +3128,11 @@ function updateBreadcrumb(path, rootName) {
 function render(data) {
   const list = document.getElementById('list');
   list.style.display = 'grid';
+  if (data.missing) {
+    list.style.display = 'block';
+    list.innerHTML = '<p style="padding:0 0.25rem;">No music folder yet. Create ~/files/music, or set MUSIC_DIR, then choose Rescan.</p>';
+    return;
+  }
   let html = '';
 
   data.folders.forEach(f => {
@@ -3072,9 +3147,11 @@ function render(data) {
     html += bookCard(b);
   });
 
-  list.innerHTML = html || '<p>Empty folder</p>';
+  const empty = library === 'music' ? '<p>No music in this folder.</p>' : '<p>Empty folder</p>';
+  list.innerHTML = html || empty;
 }
 
+updateLibraryChrome();
 loadFinished().then(function() { load(''); showContinue(); });
 </script>
 </body>
@@ -3262,6 +3339,16 @@ async function load() {
     book = await bookRes.json();
     document.getElementById('title').textContent = book.name || 'Untitled';
     document.getElementById('author').textContent = book.author || '';
+    if (book.kind === 'music') {
+      const back = document.querySelector('header a');
+      back.href = '/?library=music';
+      back.innerHTML = '&larr; Music';
+      document.title = book.name || 'Album';
+      const finish = document.getElementById('finish-btn');
+      if (finish) finish.style.display = 'none';
+      const addCol = document.querySelector('button[onclick="addToCollection()"]');
+      if (addCol) addCol.style.display = 'none';
+    }
     document.getElementById('meta-title').value = book.name || '';
     document.getElementById('meta-author').value = book.author || '';
     document.getElementById('cover').src = '/cover/' + encodeURIComponent(BOOK_ID) + '?t=' + Date.now();

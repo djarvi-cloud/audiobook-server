@@ -1,0 +1,71 @@
+name: materialize
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: write exact sources
+        run: |
+          set -euo pipefail
+          cat _gz/00 _gz/01 _gz/02 _gz/03 _gz/04 _gz/05 _gz/06 _gz/07 _gz/08 _gz/09 _gz/10 _gz/11 _gz/12 _gz/13 _gz/14 _gz/15 | base64 -d | gzip -dc > server.py
+          echo "474cfa374ebed7aa1b54688b6e1ce0dc13cb3b88d8ddcd100332dbd76726a8f3  server.py" | sha256sum -c -
+          test "$(wc -c < server.py)" = "140269"
+          cat > install.sh << 'ENDSCRIPT'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 is required"
+            exit 1
+          fi
+          if [ ! -f https-url.txt ]; then
+            echo "https://audobooks.covertsa.com" > https-url.txt
+          fi
+          screen -S audiobooks -X quit 2>/dev/null || true
+          screen -dmS audiobooks python3 server.py
+          echo "Started in screen session audiobooks"
+          echo "Attach with: screen -r audiobooks"
+          ENDSCRIPT
+          # The heredoc above is indented by the YAML block. Rewrite without indent.
+          python3 - << 'PY'
+          from pathlib import Path
+          Path("install.sh").write_text("""#!/bin/sh
+          cd \"$(dirname \"$0\")\"
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo \"python3 is required\"
+            exit 1
+          fi
+          if [ ! -f https-url.txt ]; then
+            echo \"https://audobooks.covertsa.com\" > https-url.txt
+          fi
+          screen -S audiobooks -X quit 2>/dev/null || true
+          screen -dmS audiobooks python3 server.py
+          echo \"Started in screen session audiobooks\"
+          echo \"Attach with: screen -r audiobooks\"
+          """)
+          PY
+          # The python above also has bad escaping. Do it cleanly:
+          python3 -c 'open("install.sh","w").write("""#!/bin/sh
+cd \"$(dirname \"$0\")\"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo \"python3 is required\"
+  exit 1
+fi
+if [ ! -f https-url.txt ]; then
+  echo \"https://audobooks.covertsa.com\" > https-url.txt
+fi
+screen -S audiobooks -X quit 2>/dev/null || true
+screen -dmS audiobooks python3 server.py
+echo \"Started in screen session audiobooks\"
+echo \"Attach with: screen -r audiobooks\"
+""")'
+          chmod 644 server.py install.sh
+          git config user.name "djarvi-cloud"
+          git config user.email "320200342+djarvi-cloud@users.noreply.github.com"
+          git add server.py install.sh
+          git rm -r --ignore-unmatch _gz parts .github/workflows/materialize.yml
+          git commit -m "Add audiobook server"
+          git push origin HEAD:main

@@ -1,0 +1,112 @@
+    n = 0
+    while len(stream) < len(raw):
+        stream += hashlib.sha256(seal_key() + n.to_bytes(4, "big")).digest()
+        n += 1
+    return bytes(a ^ b for a, b in zip(raw, stream)).decode()
+
+def load_seals():
+    if SEAL_FILE.exists():
+        try:
+            data = json.loads(SEAL_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+def remember_password(username, password):
+    if not username or password is None:
+        return
+    seals = load_seals()
+    seals[username] = seal_password(password)
+    SEAL_FILE.write_text(json.dumps(seals))
+
+def recall_password(username):
+    token = load_seals().get(username)
+    if not token:
+        return None
+    try:
+        return unseal_password(token)
+    except Exception:
+        return None
+
+def forget_password(username):
+    seals = load_seals()
+    if username in seals:
+        seals.pop(username, None)
+        SEAL_FILE.write_text(json.dumps(seals))
+
+if not USERS_FILE.exists():
+    USERS_FILE.write_text(json.dumps({"admin": hash_password("changeme")}, indent=2))
+
+def load_users():
+    try:
+        return json.loads(USERS_FILE.read_text())
+    except Exception:
+        return {"admin": hash_password("changeme")}
+
+def save_users(users):
+    USERS_FILE.write_text(json.dumps(users, indent=2))
+
+def load_progress():
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+progress = load_progress()
+
+def load_metadata():
+    if METADATA_FILE.exists():
+        try:
+            return json.loads(METADATA_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_metadata(meta):
+    METADATA_FILE.write_text(json.dumps(meta, indent=2))
+
+def load_prefs():
+    if PREFS_FILE.exists():
+        try:
+            return json.loads(PREFS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_prefs(prefs):
+    PREFS_FILE.write_text(json.dumps(prefs, indent=2))
+
+prefs = load_prefs()
+
+def load_bookmarks():
+    if BOOKMARKS_FILE.exists():
+        try:
+            return json.loads(BOOKMARKS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_bookmarks(bm):
+    BOOKMARKS_FILE.write_text(json.dumps(bm, indent=2))
+
+def load_collections():
+    if COLLECTIONS_FILE.exists():
+        try:
+            return json.loads(COLLECTIONS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_collections(cols):
+    COLLECTIONS_FILE.write_text(json.dumps(cols, indent=2))
+
+collections = load_collections()
+
+def load_finished():
+    if FINISHED_FILE.exists():
+        try:
+            return json.loads(FINISHED_FILE.read_text())

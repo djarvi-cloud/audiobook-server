@@ -461,18 +461,25 @@ def load_extra_libraries():
 def save_extra_libraries(paths):
     LIBRARIES_FILE.write_text(json.dumps(paths, indent=2))
 
+def _resolved_dir(raw):
+    try:
+        return Path(raw).expanduser().resolve()
+    except Exception:
+        return Path(raw).expanduser()
+
+def is_music_path(path):
+    return _resolved_dir(path) == _resolved_dir(MUSIC_DIR)
+
 def library_roots():
     roots = []
     seen = set()
-    candidates = [str(AUDIO_DIR)]
-    if MUSIC_DIR and str(MUSIC_DIR) not in candidates:
-        candidates.append(str(MUSIC_DIR))
-    candidates.extend(load_extra_libraries())
+    candidates = [str(AUDIO_DIR)] + load_extra_libraries()
+    music = _resolved_dir(MUSIC_DIR)
+    # Only attach a real music folder, and never shift existing audiobook indexes.
+    if music.is_dir():
+        candidates.append(str(music))
     for raw in candidates:
-        try:
-            p = Path(raw).expanduser().resolve()
-        except Exception:
-            p = Path(raw).expanduser()
+        p = _resolved_dir(raw)
         key = str(p)
         if key in seen:
             continue
@@ -515,6 +522,8 @@ def resolve_lib(rel: str):
 def library_list():
     items = []
     for i, root in enumerate(library_roots()):
+        if is_music_path(root):
+            continue
         items.append({
             "path": str(root),
             "name": root.name or str(root),
@@ -526,12 +535,13 @@ def library_list():
 def scan_folder(rel: str = ""):
     """Return folders and books at a given relative path."""
     roots = library_roots()
-    if not (rel or "").strip("/") and len(roots) > 1:
-        folders = [{"name": (r.name or str(r)), "path": f"~{i}~"} for i, r in enumerate(roots)]
+    book_indexes = [i for i, root in enumerate(roots) if not is_music_path(root)]
+    if not (rel or "").strip("/") and len(book_indexes) > 1:
+        folders = [{"name": (roots[i].name or str(roots[i])), "path": f"~{i}~"} for i in book_indexes]
         return {"folders": folders, "books": [], "current": "", "rootName": "Libraries"}
 
     target, root, index = resolve_lib(rel)
-    if target is None or not target.is_dir():
+    if target is None or not target.is_dir() or is_music_path(root):
         return {"folders": [], "books": [], "current": rel, "rootName": ""}
     _, inner = split_lib_path(rel)
 
@@ -652,7 +662,8 @@ def scan_books_full():
                     "files": files,
                     "cover": cover,
                     "path": join_lib_path(index, inner),
-                    "totalSize": sum(f["size"] for f in files)
+                    "totalSize": sum(f["size"] for f in files),
+                    "kind": "music" if is_music_path(library_roots()[index]) else "audiobook",
                 })
         except Exception as e:
             print(f"Walk error: {e}")
@@ -730,7 +741,8 @@ def get_book_by_id(book_id: str):
         "files": files,
         "cover": cover,
         "path": join_lib_path(index, inner),
-        "totalSize": sum(f["size"] for f in files)
+        "totalSize": sum(f["size"] for f in files),
+        "kind": "music" if is_music_path(root) else "audiobook",
     }
 
 def get_books_cached(force=False):
@@ -858,36 +870,33 @@ def playlist_visible(pl, username):
         return True
     return bool(pl.get("public"))
 
+def playlist_songs(pl):
+    songs = []
+    for sid in pl.get("songIds") or []:
+        book, index = find_book(sid)
+        files = (book or {}).get("files") or []
+        if book and index is not None and 0 <= index < len(files):
+            songs.append(song_obj(book, index, files[index]))
+    return songs
+
 def playlist_obj(pl, username, with_entries=False):
-    song_ids = pl.get("songIds") or []
-    entries = []
-    duration = 0
-    if with_entries:
-        for sid in song_ids:
-            book, index = find_book(sid)
-            if book and index is not None and 0 <= index < len(book.get("files") or []):
-                entries.append(song_obj(book, index, book["files"][index]))
-                duration += entries[-1].get("duration") or 0
-    else:
-        for sid in song_ids:
-            book, index = find_book(sid)
-            if book and index is not None:
-                files = book.get("files") or []
-                if 0 <= index < len(files):
-                    duration += guess_duration(files[index].get("size"))
-    return {
+    songs = playlist_songs(pl)
+    obj = {
         "id": pl["id"],
         "name": pl.get("name") or "Playlist",
         "comment": pl.get("comment") or "",
         "owner": pl.get("owner") or "",
         "public": bool(pl.get("public")),
-        "songCount": len(song_ids),
-        "duration": duration,
+        "songCount": len(songs),
+        "duration": sum(s.get("duration") or 0 for s in songs),
         "created": pl.get("created") or iso_now(),
         "changed": pl.get("changed") or iso_now(),
-        "coverArt": entries[0]["coverArt"] if entries else "",
-        "entry": entries if with_entries else None,
     }
+    if songs:
+        obj["coverArt"] = songs[0]["coverArt"]
+    if with_entries:
+        obj["entry"] = songs
+    return obj
 
 def iso_now(ts=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts if ts is not None else time.time()))
@@ -1110,6 +1119,7 @@ def song_obj(book, index, info):
         mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     size = int(info.get("size") or 0)
     author = book_author(book)
+    genre = "Music" if book.get("kind") == "music" else "Audiobook"
     return {
         "id": song_key(book, index),
         "parent": album_key(book),
@@ -1128,7 +1138,7 @@ def song_obj(book, index, info):
         "albumId": album_key(book),
         "artistId": artist_key(author),
         "type": "music",
-        "genre": "Audiobook",
+        "genre": genre,
     }
 
 def album_obj(book, with_songs=False):
@@ -1145,7 +1155,7 @@ def album_obj(book, with_songs=False):
         "songCount": len(songs),
         "duration": sum(s["duration"] for s in songs),
         "created": book_created(book),
-        "genre": "Audiobook",
+        "genre": "Music" if book.get("kind") == "music" else "Audiobook",
     }
     if with_songs:
         obj["song"] = songs
@@ -1631,12 +1641,17 @@ def handle_subsonic(handler, parsed):
         }})
         return
     if method == "getPlaylists":
+        asked = q1(qs, "username")
+        if asked and asked != username and username != "admin":
+            subsonic_error(handler, 50, "Not authorized", out_fmt)
+            return
         visible = []
         for pl in playlists.values():
+            if asked and pl.get("owner") != asked:
+                continue
             if playlist_visible(pl, username):
-                obj = playlist_obj(pl, username)
-                obj.pop("entry", None)
-                visible.append(obj)
+                visible.append(playlist_obj(pl, username))
+        visible.sort(key=lambda item: (item.get("name") or "").lower())
         ok({"playlists": {"playlist": visible}})
         return
     if method == "getPlaylist":
@@ -1645,16 +1660,32 @@ def handle_subsonic(handler, parsed):
         if not pl or not playlist_visible(pl, username):
             subsonic_error(handler, 70, "Playlist not found", out_fmt)
             return
-        obj = playlist_obj(pl, username, with_entries=True)
-        ok({"playlist": obj})
+        ok({"playlist": playlist_obj(pl, username, with_entries=True)})
         return
     if method == "createPlaylist":
-        name = q1(qs, "name") or "Playlist"
         song_ids = qs.get("songId") or []
         if isinstance(song_ids, str):
             song_ids = [song_ids]
-        pid = "pl_" + secrets.token_hex(8)
+        existing_id = q1(qs, "playlistId")
         now = iso_now()
+        if existing_id:
+            pl = playlists.get(existing_id)
+            if not pl:
+                subsonic_error(handler, 70, "Playlist not found", out_fmt)
+                return
+            if pl.get("owner") != username and username != "admin":
+                subsonic_error(handler, 50, "Not authorized", out_fmt)
+                return
+            if q1(qs, "name"):
+                pl["name"] = q1(qs, "name")
+            if "songId" in qs:
+                pl["songIds"] = list(song_ids)
+            pl["changed"] = now
+            save_playlists()
+            ok({"playlist": playlist_obj(pl, username, with_entries=True)})
+            return
+        name = q1(qs, "name") or "Playlist"
+        pid = "pl_" + secrets.token_hex(8)
         pl = {
             "id": pid,
             "name": name,
@@ -1667,8 +1698,7 @@ def handle_subsonic(handler, parsed):
         }
         playlists[pid] = pl
         save_playlists()
-        obj = playlist_obj(pl, username, with_entries=True)
-        ok({"playlist": obj})
+        ok({"playlist": playlist_obj(pl, username, with_entries=True)})
         return
     if method == "updatePlaylist":
         pid = q1(qs, "playlistId") or q1(qs, "id")
@@ -1676,7 +1706,7 @@ def handle_subsonic(handler, parsed):
         if not pl:
             subsonic_error(handler, 70, "Playlist not found", out_fmt)
             return
-        if pl.get("owner") != username:
+        if pl.get("owner") != username and username != "admin":
             subsonic_error(handler, 50, "Not authorized", out_fmt)
             return
         if q1(qs, "name"):
@@ -1694,10 +1724,21 @@ def handle_subsonic(handler, parsed):
         if isinstance(to_remove, str):
             to_remove = [to_remove]
         if to_remove:
-            indexes = sorted({int(i) for i in to_remove if str(i).isdigit()}, reverse=True)
-            for i in indexes:
-                if 0 <= i < len(pl.get("songIds") or []):
-                    pl["songIds"].pop(i)
+            # Indexes match the entries returned by getPlaylist (resolved songs only).
+            resolved_at = []
+            for n, sid in enumerate(pl.get("songIds") or []):
+                book, index = find_book(sid)
+                files = (book or {}).get("files") or []
+                if book and index is not None and 0 <= index < len(files):
+                    resolved_at.append(n)
+            drop = set()
+            for raw in to_remove:
+                if not str(raw).isdigit():
+                    continue
+                i = int(raw)
+                if 0 <= i < len(resolved_at):
+                    drop.add(resolved_at[i])
+            pl["songIds"] = [sid for n, sid in enumerate(pl.get("songIds") or []) if n not in drop]
         pl["changed"] = iso_now()
         save_playlists()
         ok()
@@ -1862,7 +1903,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/books":
-                books = get_books_cached()
+                books = [b for b in (get_books_cached() or []) if b.get("kind") != "music"]
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1873,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
                 book_id = path[10:]
                 print(f"Book lookup: {book_id}")
                 book = get_book_by_id(book_id)
-                if not book:
+                if not book or book.get("kind") == "music":
                     print(f"Book not found: {book_id}")
                     self.send_error(404)
                     return

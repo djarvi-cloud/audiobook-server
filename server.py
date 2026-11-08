@@ -321,6 +321,9 @@ def fetch_from_isbn(isbn: str):
     if result["title"] or result["cover_url"]:
         return result
     return None
+
+
+def fetch_from_googlebooks_url(url: str):
     """Extract metadata from a Google Books URL."""
     try:
         if "books.google" not in url and "googleapis.com/books" not in url:
@@ -348,6 +351,9 @@ def fetch_from_isbn(isbn: str):
     except Exception as e:
         print(f"Google Books URL fetch failed: {e}")
         return None
+
+
+def fetch_from_openlibrary_url(url: str):
     """Try to extract title, author, and cover from an Open Library URL."""
     try:
         # Normalize and extract OLID

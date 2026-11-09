@@ -1,6 +1,17 @@
 # Audiobook server
 
-Single-file Python audiobook (and music) server for a Whatbox seedbox. No extra packages. OpenSubsonic / Subsonic compatible.
+Python audiobook (and music) server for a Whatbox seedbox. No extra packages. OpenSubsonic / Subsonic compatible. Start it with `python3 server.py` (or `./install.sh`).
+
+The code lives in the `audiobook` package next to `server.py`:
+
+- `config.py` — paths, logging, and shared constants. Data files (`users.json`, `progress.json`, `playlists.json`, `covers/`, and the rest) stay in the directory that contains `server.py`.
+- `store.py` — users, progress, collections, bookmarks, playlists, and the daily backup.
+- `passwords.py` and `auth.py` — password hashes, sessions, and the HTTPS redirect.
+- `tags.py` — ID3, MP4, FLAC, Ogg, and WAV metadata.
+- `library.py` — audiobook and music scanning, Audible sidecars, covers, authors, and series.
+- `subsonic.py` — the Subsonic / OpenSubsonic API.
+- `stream.py` — audio streaming and zip downloads.
+- `web.py` — the website routes and pages.
 
 ## Install
 

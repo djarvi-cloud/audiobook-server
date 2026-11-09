@@ -20,7 +20,7 @@ Music is scanned the way Subsonic clients expect: `Artist/Album/Song` when that 
 
 Playlists are stored in `playlists.json` (not in git). Each logged-in user creates and manages their own from the website (Playlists) or a Subsonic client. A playlist is visible to other users only when it is public, and only the owner can change or delete it. A playlist may include music tracks and audiobook chapters.
 
-Log in at https://audobooks.covertsa.com once after the first start so Subsonic apps can connect. Default user is `admin` / `changeme` until you change it.
+Log in at https://audiobooks.covertsa.com once after the first start so Subsonic apps can connect. Default user is `admin` / `changeme` until you change it.
 
 ## Update
 

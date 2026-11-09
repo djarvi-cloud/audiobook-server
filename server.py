@@ -380,6 +380,53 @@ def sidecar_genres(data):
             take(ladder, False)
     return (genres[0] if genres else ""), genres
 
+def _seconds_value(value):
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+def runtime_seconds(data):
+    if not isinstance(data, dict):
+        return None
+    if data.get("runtime_length_sec") is not None:
+        return _seconds_value(data.get("runtime_length_sec"))
+    if data.get("runtime_length_min") is not None:
+        try:
+            return max(0, int(round(float(data["runtime_length_min"]) * 60)))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+def chapter_length_seconds(chapter):
+    if not isinstance(chapter, dict):
+        return None
+    if chapter.get("length_ms") is not None:
+        try:
+            return max(0, int(float(chapter["length_ms"]) / 1000))
+        except (TypeError, ValueError):
+            return None
+    if chapter.get("length_sec") is not None:
+        return _seconds_value(chapter.get("length_sec"))
+    return None
+
+def fill_chapter_lengths(chapters, total=None):
+    """Length is the next chapter's start, then a known runtime for the last one."""
+    rows = []
+    for chapter in chapters or []:
+        if not isinstance(chapter, dict):
+            continue
+        row = {"title": chapter.get("title") or "", "start": max(0, int(chapter.get("start") or 0))}
+        if chapter.get("length") is not None:
+            row["length"] = max(0, int(chapter.get("length") or 0))
+        rows.append(row)
+    for i, row in enumerate(rows):
+        if row.get("length") is None and i + 1 < len(rows):
+            row["length"] = max(0, rows[i + 1]["start"] - row["start"])
+    if rows and rows[-1].get("length") is None and total is not None:
+        rows[-1]["length"] = max(0, int(total) - rows[-1]["start"])
+    return rows
+
 def sidecar_details(data):
     if not isinstance(data, dict):
         return "", [], "", "", []
@@ -392,14 +439,22 @@ def sidecar_details(data):
             if not isinstance(chapter, dict):
                 continue
             title = (chapter.get("title") or "").strip()
+            start = None
             if chapter.get("start_offset_sec") is not None:
-                start = int(float(chapter["start_offset_sec"]))
-            elif chapter.get("start_offset_ms") is not None:
-                start = int(float(chapter["start_offset_ms"]) / 1000)
-            else:
+                start = _seconds_value(chapter.get("start_offset_sec"))
+            if start is None and chapter.get("start_offset_ms") is not None:
+                try:
+                    start = max(0, int(float(chapter["start_offset_ms"]) / 1000))
+                except (TypeError, ValueError):
+                    start = None
+            if start is None or not title:
                 continue
-            if title:
-                chapters.append({"title": title, "start": max(0, start)})
+            row = {"title": title, "start": start}
+            length = chapter_length_seconds(chapter)
+            if length is not None:
+                row["length"] = length
+            chapters.append(row)
+        chapters = fill_chapter_lengths(chapters, runtime_seconds(data))
     images = data.get("product_images") or {}
     cover_url = ""
     if isinstance(images, dict) and images:
@@ -963,7 +1018,7 @@ def load_https_redirect():
                     url = line
                     break
     if not url:
-        url = "https://audobooks.covertsa.com"
+        url = "https://audiobooks.covertsa.com"
     if url and not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     return url.rstrip("/")
@@ -2204,7 +2259,12 @@ def music_album_obj(album, with_songs=False):
     return obj
 
 def music_as_book(album):
-    files = [{"name": f.get("name"), "rel": f.get("rel"), "size": int(f.get("size") or 0)} for f in album.get("files") or []]
+    files = [{
+        "name": f.get("name"),
+        "rel": f.get("rel"),
+        "size": int(f.get("size") or 0),
+        "duration": int(f.get("duration") or 0),
+    } for f in album.get("files") or []]
     return {
         "id": album["id"],
         "name": album.get("name") or "Untitled",
@@ -2639,6 +2699,7 @@ def web_playlist_tracks(pl):
             "album": song.get("album") or "",
             "bookId": book_id,
             "fileIndex": file_index,
+            "duration": int(song.get("duration") or 0),
         })
     return tracks
 
@@ -3248,6 +3309,32 @@ def handle_subsonic(handler, parsed):
         return
     subsonic_error(handler, 70, "Unknown method", out_fmt)
 
+def attach_file_duration(book):
+    """Fill a missing last-chapter length from a real audio header, not a bitrate guess."""
+    if not book:
+        return book
+    chapters = book.get("chapters") or []
+    if not chapters or chapters[-1].get("length") is not None:
+        return book
+    files = book.get("files") or []
+    if len(files) != 1:
+        return book
+    path = resolve_item_file(book, files[0].get("rel") or "")
+    if path is None or not path.is_file():
+        return book
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return book
+    duration = int(read_audio_meta(path).get("duration") or 0)
+    if not duration or duration == guess_duration(size):
+        return book
+    if duration <= int(chapters[-1].get("start") or 0):
+        return book
+    updated = dict(book)
+    updated["chapters"] = fill_chapter_lengths(chapters, duration)
+    return updated
+
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         # Some players send HEAD first
@@ -3298,7 +3385,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path.startswith("/book/"):
-                book_id = path[6:]
+                book_id = urllib.parse.unquote(path[6:])
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -3429,9 +3516,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path.startswith("/api/book/"):
-                book_id = path[10:]
+                book_id = urllib.parse.unquote(path[10:])
                 log.debug(f"Book lookup: {book_id}")
-                book = get_book_by_id(book_id)
+                book = attach_file_duration(get_book_by_id(book_id))
                 if not book:
                     log.info(f"Book not found: {book_id}")
                     self.send_error(404)
@@ -3498,7 +3585,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path.startswith("/stream/"):
-                parts = path[8:].split("/")
+                parts = [urllib.parse.unquote(part) for part in path[8:].split("/")]
                 book_id = parts[0]
                 try:
                     file_index = int(parts[1]) if len(parts) > 1 else 0
@@ -3528,7 +3615,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path.startswith("/cover/"):
-                book_id = path[7:]
+                book_id = urllib.parse.unquote(path[7:])
                 book = get_book_by_id(book_id)
                 if not book:
                     self.send_error(404)
@@ -4322,9 +4409,16 @@ HTML = '''<!DOCTYPE html>
     color: #fff; 
     border-color: var(--accent); 
   }
-  #continue { padding: 1.25rem 1.75rem 0; }
+  #continue { padding: 0.85rem 1.25rem 0; }
   #continue h3 { margin: 0 0 0.6rem; font-size: 0.95rem; font-weight: 600; color: var(--muted); }
-  #continue-list .item { min-width: 140px; }
+  #continue-list {
+    display: flex;
+    gap: 0.75rem;
+    overflow-x: auto;
+    padding-bottom: 0.55rem;
+    scroll-snap-type: x proximity;
+  }
+  #continue-list .item { flex: 0 0 156px; width: 156px; min-width: 0; scroll-snap-align: start; }
   .error { color: #f66; padding: 1rem; }
   #shell { display: flex; flex-direction: column; min-height: 100vh; }
   #sidebar {
@@ -4344,7 +4438,8 @@ HTML = '''<!DOCTYPE html>
     padding: 0.9rem 0.85rem;
   }
   #sidebar.open { display: block; }
-  #main { width: 100%; max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; }
+  #main { width: 100%; max-width: none; margin: 0; display: flex; flex-direction: column; min-width: 0; }
+  #main > * { min-width: 0; max-width: 100%; }
   #topbar {
     position: sticky;
     top: 0;
@@ -4353,14 +4448,29 @@ HTML = '''<!DOCTYPE html>
     align-items: center;
     gap: 0.6rem;
     flex-wrap: wrap;
-    padding: 0.6rem 0.75rem;
+    padding: 0.6rem 1.25rem;
     background: var(--card);
     border-bottom: 1px solid var(--border);
   }
   #menu-btn { min-height: 40px; }
   #topbar #global-search { flex: 1; width: auto; max-width: none; min-height: 40px; font-size: 16px; }
-  #list { padding: 0.75rem; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.7rem; }
-  #continue { padding: 0.75rem 0.75rem 0; }
+  #breadcrumb { font-size: 0.85rem; padding: 0.75rem 1.25rem 0; }
+  #list {
+    padding: 0.75rem 1.25rem 1.5rem;
+    grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+    gap: 0.85rem;
+  }
+  #list > p, #list > .error { grid-column: 1 / -1; margin: 0.25rem 0; }
+  .panel { padding: 0.35rem 0.15rem 1.5rem; }
+  .panel h3 { margin: 0.2rem 0 0.6rem; }
+  .panel p { max-width: 70rem; }
+  @media (max-width: 700px) {
+    #topbar { padding: 0.6rem 0.75rem; }
+    #breadcrumb { padding: 0.7rem 0.75rem 0; }
+    #continue { padding: 0.75rem 0.75rem 0; }
+    #list { padding: 0.65rem 0.75rem 1.25rem; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 0.65rem; }
+    #continue-list .item { flex-basis: calc((100% - 0.75rem) / 2.15); width: calc((100% - 0.75rem) / 2.15); }
+  }
 </style>
 </head>
 <body>
@@ -4393,10 +4503,10 @@ HTML = '''<!DOCTYPE html>
         <option value="">All genres</option>
       </select>
     </header>
-    <div id="breadcrumb" style="font-size:0.85rem; padding:0.75rem 0.75rem 0;"></div>
+    <div id="breadcrumb"></div>
     <div id="continue" style="display:none;">
-      <h3 style="margin:0 0 0.6rem; font-size:0.9rem; color:var(--muted);">Continue Listening</h3>
-      <div id="continue-list" style="display:flex; gap:0.75rem; overflow-x:auto; padding-bottom:0.5rem;"></div>
+      <h3>Continue Listening</h3>
+      <div id="continue-list"></div>
     </div>
     <div id="list">Loading...</div>
   </div>
@@ -4406,6 +4516,28 @@ const IS_ADMIN = {{IS_ADMIN}};
 if (IS_ADMIN) {
   document.getElementById('users-link').style.display = 'inline';
   document.getElementById('libraries-link').style.display = 'inline';
+}
+
+function fmtTime(seconds) {
+  var s = Math.floor(Math.max(0, Number(seconds) || 0));
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  var ss = String(sec).padStart(2, '0');
+  if (h) return h + ':' + String(m).padStart(2, '0') + ':' + ss;
+  return m + ':' + ss;
+}
+
+function useGrid() {
+  var list = document.getElementById('list');
+  list.style.display = 'grid';
+  return list;
+}
+
+function usePage(html) {
+  var list = document.getElementById('list');
+  list.style.display = 'block';
+  list.innerHTML = html;
 }
 
 let currentPath = '';
@@ -4433,6 +4565,7 @@ const requestedLibrary = new URLSearchParams(location.search).get('library');
 let library = requestedLibrary === 'music' || requestedLibrary === 'books'
   ? requestedLibrary
   : (localStorage.getItem('library') === 'music' ? 'music' : 'books');
+viewMode = library === 'music' ? 'folders' : 'books';
 
 function setLibrary(next) {
   library = next === 'music' ? 'music' : 'books';
@@ -4453,6 +4586,8 @@ function updateLibraryChrome() {
   document.getElementById('tab-music').classList.toggle('active', music);
   document.getElementById('nav-collections').style.display = music ? 'none' : '';
   document.getElementById('nav-finished').style.display = music ? 'none' : '';
+  const filter = document.getElementById('genre-filter');
+  if (filter) filter.style.display = music ? 'none' : '';
   document.getElementById('global-search').placeholder = music ? 'Search music...' : 'Search books...';
   const toggle = document.getElementById('view-toggle');
   if (viewMode === 'folders') toggle.textContent = music ? 'All Albums' : 'All Books';
@@ -4500,7 +4635,7 @@ async function showAllBooks() {
   document.getElementById('continue').style.display = '';
   showContinue();
   const empty = music ? '<p>No music found.</p>' : '<p>No books found.</p>';
-  document.getElementById('list').innerHTML = music
+  useGrid().innerHTML = music
     ? (books.length ? books.map(b => bookCard(b)).join('') : empty)
     : renderGenreBooks(books);
 }
@@ -4565,7 +4700,7 @@ async function showCollections() {
   const r = await fetch('/api/collections');
   const cols = await r.json();
   const names = Object.keys(cols);
-  let html = '<div style="padding:1.5rem;"><h3>Collections</h3>';
+  let html = '<div class="panel"><h3>Collections</h3>';
   html += '<div style="margin:1rem 0;"><input id="new-col" placeholder="New collection name" style="padding:0.4rem; margin-right:0.5rem;"><button onclick="createCollection()">Create</button></div>';
   if (!names.length) html += '<p>No collections yet.</p>';
   else {
@@ -4576,7 +4711,7 @@ async function showCollections() {
       </div>`).join('');
   }
   html += '</div>';
-  document.getElementById('list').innerHTML = html;
+  usePage(html);
   document.getElementById('breadcrumb').innerHTML = 'Collections';
 }
 
@@ -4598,15 +4733,15 @@ async function viewCollection(name) {
   const ids = colsRes[name] || [];
   const booksInCol = books.filter(b => ids.includes(b.id));
   document.getElementById('breadcrumb').innerHTML = 'Collections / ' + name;
-  document.getElementById('list').innerHTML = booksInCol.length ? booksInCol.map(b => bookCard(b)).join('') : '<p>Empty collection.</p>';
+  useGrid().innerHTML = booksInCol.length ? booksInCol.map(b => bookCard(b)).join('') : '<p>Empty collection.</p>';
 }
 
 async function showPlaylists() {
   const r = await fetch('/api/playlists');
   const lists = await r.json();
-  let html = '<div style="padding:1.5rem; max-width:720px;"><h3>Playlists</h3>';
+  let html = '<div class="panel"><h3>Playlists</h3>';
   html += '<p style="color:var(--muted);">Yours only, unless you mark one public. Other people can play a public playlist but cannot change it.</p>';
-  html += '<div style="margin:1rem 0; display:flex; gap:0.5rem;"><input id="new-pl" placeholder="New playlist name" style="flex:1; padding:0.45rem 0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);"><button onclick="createPlaylist()">Create</button></div>';
+  html += '<div style="margin:1rem 0; display:flex; gap:0.5rem; max-width:36rem;"><input id="new-pl" placeholder="New playlist name" style="flex:1; padding:0.45rem 0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);"><button onclick="createPlaylist()">Create</button></div>';
   if (!lists.length) html += '<p>No playlists yet.</p>';
   lists.forEach(pl => {
     const label = esc(pl.name) + ' <span style="color:var(--muted);">(' + pl.songCount + ')</span>';
@@ -4617,7 +4752,7 @@ async function showPlaylists() {
     html += '</div>';
   });
   html += '</div>';
-  document.getElementById('list').innerHTML = html;
+  usePage(html);
   document.getElementById('breadcrumb').innerHTML = 'Playlists';
   document.getElementById('continue').style.display = 'none';
 }
@@ -4662,7 +4797,7 @@ async function showFinished() {
   const done = books.filter(b => finishedIds.has(b.id));
   document.getElementById('breadcrumb').innerHTML = '<a href="#" onclick="load(\\'\\'); return false;">Library</a> / Finished';
   document.getElementById('continue').style.display = 'none';
-  document.getElementById('list').innerHTML = done.length ? done.map(b => bookCard(b,
+  useGrid().innerHTML = done.length ? done.map(b => bookCard(b,
     `<button onclick="event.stopPropagation(); returnToLibrary('${b.id}')" style="margin-top:0.4rem;">Return to library</button>`
   )).join('') : '<p>No finished books. Open a book and choose Mark Finished.</p>';
 }
@@ -4691,10 +4826,11 @@ async function showContinue() {
     document.getElementById('continue-list').innerHTML = recent.map(x => {
       const folder = x.book.path ? x.book.path.split('/').slice(-2, -1)[0] || x.book.path : '';
       return `
-      <div class="item" style="min-width:140px; width:140px; flex-shrink:0; position:relative;" onclick="location.href='/book/${x.id}'">
+      <div class="item" style="position:relative;" onclick="location.href='/book/${x.id}'">
         <img class="cover" src="/cover/${x.id}" alt="" loading="lazy" onerror="this.style.background='#333'; this.src=''">
         <div class="item-info">
           <div class="item-name">${x.book.name || 'Untitled'}</div>
+          <div class="author">${fmtTime(x.time)}</div>
           ${folder ? `<div class="author">${folder}</div>` : ''}
         </div>
         <button onclick="event.stopPropagation(); removeContinue('${x.id}')" style="position:absolute; top:4px; right:4px; padding:0.15rem 0.4rem; font-size:0.75rem; background:rgba(0,0,0,.55); color:#fff; border:none; border-radius:6px;">×</button>
@@ -4723,7 +4859,7 @@ async function globalSearch() {
     )
   );
   const empty = library === 'music' ? '<p>No music matches</p>' : '<p>No matches</p>';
-  document.getElementById('list').innerHTML = matches.length ? matches.map(b => bookCard(b)).join('') : empty;
+  useGrid().innerHTML = matches.length ? matches.map(b => bookCard(b)).join('') : empty;
   document.getElementById('breadcrumb').innerHTML = 'Search results';
 }
 
@@ -4783,7 +4919,7 @@ async function showLibraries() {
   const r = await fetch('/api/libraries');
   const libs = await r.json();
   window._libs = libs;
-  let html = '<div style="padding:1.5rem; max-width:720px;"><h3>Library folders</h3>';
+  let html = '<div class="panel"><h3>Library folders</h3>';
   html += '<p style="color:var(--muted);">The first folder is the original library and stays. Add other full paths on this server. Files are not moved or deleted.</p>';
   html += '<div style="margin:1rem 0; display:flex; gap:0.5rem; flex-wrap:wrap;">';
   html += '<input id="new-lib" placeholder="/home/you/files/more-books" style="flex:1; min-width:240px; padding:0.45rem 0.6rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg);">';
@@ -4799,9 +4935,7 @@ async function showLibraries() {
     html += '</div>';
   });
   html += '</div>';
-  const list = document.getElementById('list');
-  list.style.display = 'block';
-  list.innerHTML = html;
+  usePage(html);
   document.getElementById('breadcrumb').innerHTML = 'Libraries';
   document.getElementById('continue').style.display = 'none';
 }
@@ -4908,7 +5042,8 @@ PLAYLIST_HTML = '''<!DOCTYPE html>
   body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; margin:0; background:var(--bg); color:var(--fg); }
   header { padding:0.9rem 1.25rem; background:var(--card); border-bottom:1px solid var(--border); }
   header a { color:var(--accent); text-decoration:none; }
-  .wrap { max-width:760px; margin:0 auto; padding:1.25rem; }
+  .wrap { margin:0; padding:1.25rem 1.5rem 2rem; }
+  @media (max-width: 700px) { .wrap { padding: 0.9rem 0.75rem 1.5rem; } }
   button { background:transparent; color:var(--fg); border:1px solid var(--border); padding:0.35rem 0.65rem; border-radius:8px; cursor:pointer; }
   button:hover { background:var(--accent); color:#fff; border-color:var(--accent); }
   li { list-style:none; margin:0.35rem 0; padding:0.55rem 0.7rem; background:var(--card); border:1px solid var(--border); border-radius:8px; display:flex; gap:0.5rem; align-items:center; }
@@ -4944,6 +5079,16 @@ function esc(s) {
   });
 }
 
+function fmtTime(seconds) {
+  var s = Math.floor(Math.max(0, Number(seconds) || 0));
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  var ss = String(sec).padStart(2, "0");
+  if (h) return h + ":" + String(m).padStart(2, "0") + ":" + ss;
+  return m + ":" + ss;
+}
+
 async function load() {
   const r = await fetch("/api/playlists?id=" + encodeURIComponent(PID));
   if (!r.ok) {
@@ -4975,7 +5120,8 @@ function render() {
     const manage = pl.mine
       ? '<button onclick="moveTrack(' + i + ',-1)">Up</button><button onclick="moveTrack(' + i + ',1)">Down</button><button onclick="removeTrack(' + i + ')">Remove</button>'
       : "";
-    return '<li class="' + (i === current ? "active" : "") + '"><div class="grow" onclick="play(' + i + ', true)"><div>' + esc(t.title) + '</div><div class="muted">' + esc(t.artist) + (t.album ? " · " + esc(t.album) : "") + '</div></div>' + manage + "</li>";
+    const dur = t.duration ? '<span class="muted">' + fmtTime(t.duration) + '</span>' : '';
+    return '<li class="' + (i === current ? "active" : "") + '"><div class="grow" onclick="play(' + i + ', true)"><div>' + esc(t.title) + '</div><div class="muted">' + esc(t.artist) + (t.album ? " · " + esc(t.album) : "") + '</div></div>' + dur + manage + "</li>";
   }).join("");
 }
 
@@ -5094,7 +5240,17 @@ BOOK_HTML = '''<!DOCTYPE html>
     cursor: pointer; 
     border-radius: 6px;
     transition: background 0.12s;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
   }
+  .ch-title { flex: 1; min-width: 0; }
+  .ch-time { margin-left: auto; text-align: right; flex: none; }
+  .ch-len, .ch-start { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ch-len { color: var(--fg); font-size: 0.92rem; }
+  .ch-start { color: var(--muted); font-size: 0.75rem; }
+  #tracks li button { flex: none; }
   #tracks li:hover, #tracks li.active { background: var(--card); }
   #player { 
     margin-top: 1.75rem; 
@@ -5200,6 +5356,26 @@ BOOK_HTML = '''<!DOCTYPE html>
 const BOOK_ID = "{{BOOK_ID}}";
 let book = null, fileIndex = 0, progress = {}, userPrefs = {}, bookBookmarks = [];
 const audio = document.getElementById('audio');
+
+function fmtTime(seconds) {
+  var s = Math.floor(Math.max(0, Number(seconds) || 0));
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  var ss = String(sec).padStart(2, '0');
+  if (h) return h + ':' + String(m).padStart(2, '0') + ':' + ss;
+  return m + ':' + ss;
+}
+
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, function(c) {
+    if (c === '&') return '&' + 'amp;';
+    if (c === '<') return '&' + 'lt;';
+    if (c === '>') return '&' + 'gt;';
+    if (c === '"') return '&' + 'quot;';
+    return '&' + '#39;';
+  });
+}
 audio.volume = 1;
 audio.muted = false;
 let nextAudio = new Audio();
@@ -5253,7 +5429,7 @@ async function load() {
       document.getElementById('speed').value = speed;
       audio.playbackRate = parseFloat(speed);
       if (saved.time) {
-        document.getElementById('progress-info').textContent = `Resume at ${Math.floor(saved.time/60)}m`;
+        document.getElementById('progress-info').textContent = 'Resume at ' + fmtTime(saved.time);
       }
       updateActive();
     } catch (e) {
@@ -5279,7 +5455,7 @@ function renderBookmarks() {
   const row = (bm, i) => `
       <li style="margin:0.3rem 0;">
         <a href="#" onclick="jumpTo(${bm.fileIndex}, ${bm.time}); return false;">
-          Track ${bm.fileIndex+1} @ ${Math.floor(bm.time/60)}:${(Math.floor(bm.time)%60).toString().padStart(2,'0')}
+          Track ${bm.fileIndex+1} @ ${fmtTime(bm.time)}
         </a>
         ${bm.note && bm.note !== 'auto' ? ' — ' + bm.note : ''}
         <button onclick="deleteBookmark(${i})" style="margin-left:0.5rem; padding:0.1rem 0.4rem; font-size:0.8rem;">×</button>
@@ -5367,18 +5543,23 @@ function renderTracks() {
   const chapters = (book.kind === 'music') ? [] : (book.chapters || []);
   if (chapters.length) {
     ul.innerHTML = chapters.map(ch => {
-      const label = String(ch.title || '').replace(/&/g, '&').replace(/</g, '<');
-      const mins = Math.floor(ch.start / 60);
-      const secs = String(Math.floor(ch.start % 60)).padStart(2, '0');
-      return '<li data-start="' + ch.start + '" onclick="seekChapter(' + ch.start + ')" style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;"><span style="flex:1;">' + label + '</span><span style="color:var(--muted); font-size:0.8rem;">' + mins + ':' + secs + '</span></li>';
+      const label = esc(ch.title || '');
+      const start = fmtTime(ch.start);
+      const hasLen = ch.length != null && ch.length !== '';
+      const time = hasLen
+        ? '<span class="ch-len">' + fmtTime(ch.length) + '</span><span class="ch-start">starts ' + start + '</span>'
+        : '<span class="ch-len">starts ' + start + '</span>';
+      return '<li data-start="' + ch.start + '" onclick="seekChapter(' + ch.start + ')"><span class="ch-title">' + label + '</span><span class="ch-time">' + time + '</span></li>';
     }).join('');
     updateActive();
     return;
   }
   ul.innerHTML = book.files.map((f, i) => {
-    const safeName = (f.name || '').replace(/&/g, '&').replace(/</g, '<');
-    return `<li data-idx="${i}" style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
-      <span style="flex:1;">${safeName}</span>
+    const safeName = esc(f.name || '');
+    const dur = Number(f.duration) > 0 ? '<span class="ch-len">' + fmtTime(f.duration) + '</span>' : '';
+    return `<li data-idx="${i}">
+      <span class="ch-title">${safeName}</span>
+      <span class="ch-time">${dur}</span>
       <button type="button" onclick="playIndex(${i})">Play</button>
     </li>`;
   }).join('');
@@ -5549,8 +5730,8 @@ audio.ontimeupdate = () => {
   // Time info
   if (audio.duration) {
     const rem = audio.duration - audio.currentTime;
-    document.getElementById('time-info').textContent = 
-      `${Math.floor(audio.currentTime/60)}:${(Math.floor(audio.currentTime)%60).toString().padStart(2,'0')} / ${Math.floor(audio.duration/60)}:${(Math.floor(audio.duration)%60).toString().padStart(2,'0')} (${Math.floor(rem/60)}m left)`;
+    document.getElementById('time-info').textContent =
+      fmtTime(audio.currentTime) + ' / ' + fmtTime(audio.duration) + ' (' + fmtTime(rem) + ' left)';
   }
 };
 
